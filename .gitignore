@@ -1,0 +1,42 @@
+# Local Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build and release outputs
+release_artifacts/
+build/
+dist/
+installer_output/
+*.spec.tmp
+
+# Local dependency folders used by this prototype
+.deps/
+.deps_paddle/
+.py310build/
+.py310deps/
+.py310gui/
+.py310iopaint/
+
+# Runtime workspaces and temporary conversion output
+_gui_workspace/
+_work_clean_rebuild/
+_mvp_test*/
+tmp_*/
+verify_*/
+cleaned_slides/
+rebuilt_export/
+ref_export/
+slides_export/
+
+# Large local deck samples and generated documents
+*.ppt
+*.pptx
+*.pps
+*.ppsx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

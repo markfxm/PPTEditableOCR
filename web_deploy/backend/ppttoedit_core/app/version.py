@@ -1,0 +1,4 @@
+APP_NAME = "PPT Editable OCR"
+APP_EXE_NAME = "PPTEditableOCR"
+APP_VERSION = "0.1.0"
+APP_PUBLISHER = "OpenAI Codex MVP"

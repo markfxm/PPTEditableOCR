@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PPT 图片转可编辑文字 - Web</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>PPT 图片转可编辑文字 - Web</h1>
+        <p>上传 PDF 或 PPT，云端识别，检查识别框后导出可编辑 PPT。</p>
+      </div>
+      <div class="actions">
+        <label class="upload-button">
+          <input id="fileInput" type="file" accept=".pdf,.pptx" />
+          打开 PDF/PPT
+        </label>
+        <button id="exportBtn" type="button" disabled>导出可编辑 PPT</button>
+        <a id="downloadBtn" class="download disabled" href="#">下载结果</a>
+        <button id="manualBtn" type="button">说明书</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section>
+          <h2>页面</h2>
+          <div id="slideList" class="slide-list"></div>
+        </section>
+        <section>
+          <h2>日志</h2>
+          <pre id="logBox" class="log"></pre>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div class="status">
+          <span id="statusText">等待上传文件</span>
+          <div class="progress"><div id="progressBar"></div></div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="slideCanvas"></canvas>
+          <div id="emptyHint" class="empty-hint">上传 PDF 或 PPT 后，这里会显示页面预览和识别框。</div>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <section>
+          <h2>PPT 列表</h2>
+          <div id="pptList" class="ppt-list"></div>
+        </section>
+
+        <section>
+          <h2>识别框</h2>
+          <label>
+            横向边距
+            <input id="padXInput" type="number" value="16" min="0" step="1" disabled />
+          </label>
+          <label>
+            纵向边距
+            <input id="padYInput" type="number" value="12" min="0" step="1" disabled />
+          </label>
+          <button id="repadAllBtn" class="wide-btn" type="button" disabled>当前页所有框按边距重算</button>
+          <button id="repadSelectedBtn" class="wide-btn" type="button" disabled>选中框按边距重算</button>
+
+          <div class="field-row">
+            <button id="addBoxBtn" type="button" disabled>新增框</button>
+            <button id="deleteBoxBtn" type="button" disabled>删除框</button>
+          </div>
+          <label class="check-row">
+            <input id="enabledInput" type="checkbox" checked disabled />
+            选中框参与擦除和重建
+          </label>
+          <label class="check-row">
+            <input id="watermarkInput" type="checkbox" checked disabled />
+            清除当前页右下角水印区域
+          </label>
+          <div id="selectionLabel" class="selection-label">未选择任何框</div>
+          <label>
+            文本
+            <textarea id="textInput" rows="7" disabled></textarea>
+          </label>
+          <label>
+            旋转
+            <select id="rotationInput" disabled>
+              <option value="0">0°</option>
+              <option value="90">90°</option>
+              <option value="270">270°</option>
+            </select>
+          </label>
+          <div class="hint">新增框会出现在右上角区域。拖动框体移动；拖动四角或边缘缩放。修改会自动同步到服务器，导出前会使用最新识别框。</div>
+        </section>
+      </aside>
+    </main>
+
+    <div id="manualOverlay" class="manual-overlay" hidden></div>
+    <aside id="manualPanel" class="manual-panel" aria-hidden="true">
+      <div class="manual-header">
+        <h2>使用说明</h2>
+      </div>
+      <div class="manual-body">
+        <section>
+          <h3>1. 基本流程</h3>
+          <p>(1) 点击“打开 PDF/PPT”，上传 PDF 或 PPTX。</p>
+          <p>(2) PDF 会先在服务端转成每页一张图片的 PPT，再进入 OCR。</p>
+          <p>(3) OCR 完成后，左侧会显示“第1页、第2页...”和每页识别框数量。</p>
+          <p>(4) 点击左侧页面，在中间预览区检查并调整识别框。</p>
+          <p>(5) 点击“导出可编辑 PPT”，服务端生成结果后再点击“下载结果”。</p>
+        </section>
+        <section>
+          <h3>2. 识别框</h3>
+          <p>(1) 拖动框体可以移动；拖动四角或边缘可以缩放。</p>
+          <p>(2) 右侧文本框可修改导出的文字内容。</p>
+          <p>(3) “新增框”会先出现在当前页右上角区域，方便找到；之后可拖动到目标文字位置。</p>
+          <p>(4) 取消“选中框参与擦除和重建”后，该框不会参与底图擦除，也不会重建为可编辑文字。</p>
+        </section>
+        <section>
+          <h3>3. 边距和水印</h3>
+          <p>(1) 横向边距、纵向边距用于扩大擦除区域。</p>
+          <p>(2) 可以对当前页所有框重算，也可以只重算选中的框。</p>
+          <p>(3) “清除当前页右下角水印区域”会额外擦除页面右下角默认水印区域。</p>
+        </section>
+        <section>
+          <h3>4. 文件保存</h3>
+          <p>(1) 导出结果会先保存在服务端任务目录中，再通过“下载结果”下载到本机。</p>
+        </section>
+      </div>
+    </aside>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

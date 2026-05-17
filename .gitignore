@@ -21,6 +21,10 @@ installer_output/
 # Runtime workspaces and temporary conversion output
 _gui_workspace/
 _work_clean_rebuild/
+web_deploy/.webvenv/
+web_deploy/data/jobs/
+web_deploy/data/redis/
+web_deploy/data/certs/
 _mvp_test*/
 tmp_*/
 verify_*/

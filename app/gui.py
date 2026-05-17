@@ -602,7 +602,7 @@ class MainWindow(QMainWindow):
         self.pending_pdf_loaded_notice = output_pptx
 
     def open_ppt(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择 PPT 文件", "", "PowerPoint (*.pptx *.ppt)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择 PPT 文件", "", "PowerPoint (*.pptx)")
         if not path:
             return
         self.load_ppt_path(Path(path), add_to_list=True, select_in_list=True)

@@ -497,6 +497,8 @@ $("deleteBoxBtn").addEventListener("click", () => {
 
 $("exportBtn").addEventListener("click", async () => {
   if (!state.jobId) return;
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
   await saveCurrentSlide();
   $("downloadBtn").classList.add("disabled");
   await request(`/jobs/${state.jobId}/export`, { method: "POST" });

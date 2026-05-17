@@ -302,6 +302,15 @@ def default_pdf_pptx_path(source_pdf: Path) -> Path:
     return unique_output_path(source_pdf.with_name(f"{source_pdf.stem}-from-pdf.pptx"))
 
 
+def fit_rect_to_slide(image_width: int, image_height: int, slide_width: int, slide_height: int) -> tuple[int, int, int, int]:
+    scale = min(slide_width / image_width, slide_height / image_height)
+    width = int(image_width * scale)
+    height = int(image_height * scale)
+    left = int((slide_width - width) / 2)
+    top = int((slide_height - height) / 2)
+    return left, top, width, height
+
+
 def convert_pdf_to_pptx(source_pdf: Path, output_pptx: Path | None = None, progress: ProgressCB = None) -> Path:
     import pypdfium2
 
@@ -340,17 +349,24 @@ def convert_pdf_to_pptx(source_pdf: Path, output_pptx: Path | None = None, progr
             image_path = temp_root / f"page_{page_index + 1:04d}.png"
             bitmap = page.render(scale=2)
             image = bitmap.to_pil().convert("RGB")
+            image_width, image_height = image.size
             image.save(image_path)
             bitmap.close()
             page.close()
 
             slide = out.slides.add_slide(blank)
+            left, top, width, height = fit_rect_to_slide(
+                image_width,
+                image_height,
+                out.slide_width,
+                out.slide_height,
+            )
             slide.shapes.add_picture(
                 str(image_path),
-                0,
-                0,
-                width=out.slide_width,
-                height=out.slide_height,
+                left,
+                top,
+                width=width,
+                height=height,
             )
             done = page_index + 1
             _progress(progress, int(done * 100 / page_count), f"PDF 转 PPT：{done}/{page_count}")
@@ -506,99 +522,6 @@ def os_environ_with_pythonpath():
         env["XDG_CACHE_HOME"] = str(bundled_model_root)
         env["U2NET_HOME"] = str(bundled_model_root)
     return env
-
-
-def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: ProgressCB = None):
-    if cleaned_dir.exists():
-        shutil.rmtree(cleaned_dir)
-    cleaned_dir.mkdir(parents=True, exist_ok=True)
-    _log(progress, "开始用 IOPaint 擦除底图文字")
-    _progress(progress, 0, "IOPaint 擦除处理中")
-    cmd = [
-        sys.executable,
-        "-m",
-        "iopaint",
-        "run",
-        "--model",
-        "lama",
-        "--device",
-        "cpu",
-        "--image",
-        str(images_dir),
-        "--mask",
-        str(masks_dir),
-        "--output",
-        str(cleaned_dir),
-    ]
-    env = os_environ_with_pythonpath()
-    env["PYTHONUNBUFFERED"] = "1"
-    total_images = max(1, len([path for path in masks_dir.iterdir() if path.is_file()]))
-    last_done = 0
-    last_percent = -1
-    percent_re = re.compile(r"(\d{1,3})%\s+(\d+)\s*/\s*(\d+)")
-    count_re = re.compile(r"(\d+)\s*/\s*(\d+)")
-    ansi_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=env,
-        cwd=str(BASE),
-    )
-    assert process.stdout is not None
-    buffer = ""
-
-    def emit_iopaint_progress(done: int, total: int):
-        nonlocal last_done, last_percent
-        total = max(1, total)
-        done = max(0, min(done, total))
-        percent = int(done * 100 / total)
-        if done != last_done or percent != last_percent:
-            last_done = done
-            last_percent = percent
-            _progress(progress, percent, f"IOPaint 擦除处理中：{done}/{total}")
-
-    def handle_output(text: str):
-        nonlocal last_done
-        text = ansi_re.sub("", text).strip()
-        if not text:
-            return
-        match = percent_re.search(text)
-        if match:
-            percent = max(0, min(100, int(match.group(1))))
-            done = int(match.group(2))
-            total = int(match.group(3))
-            last_done = done
-            _progress(progress, percent, f"IOPaint 擦除处理中：{done}/{total}")
-            return
-        match = count_re.search(text)
-        if match and "Batch processing" in text:
-            emit_iopaint_progress(int(match.group(1)), int(match.group(2)))
-            return
-        if "Run crop strategy" in text:
-            emit_iopaint_progress(last_done + 1, total_images)
-
-    while True:
-        char = process.stdout.read(1)
-        if char == "" and process.poll() is not None:
-            break
-        if not char:
-            continue
-        if char in {"\r", "\n"}:
-            handle_output(buffer)
-            buffer = ""
-        else:
-            buffer += char
-    handle_output(buffer)
-    return_code = process.wait()
-    if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, cmd)
-    _progress(progress, 100, f"IOPaint 擦除完成：{total_images}/{total_images}")
-    _log(progress, "IOPaint 擦除完成")
 
 
 def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: ProgressCB = None):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,11 @@ from app.core import OCRBox, PPTProject, PPTSlide
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
 JOBS_DIR = DATA_DIR / "jobs"
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class InvalidJobId(ValueError):
+    pass
 
 
 def ensure_data_dirs() -> None:
@@ -18,7 +24,12 @@ def ensure_data_dirs() -> None:
 
 
 def job_dir(job_id: str) -> Path:
-    return JOBS_DIR / job_id
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise InvalidJobId("Invalid job id")
+    path = (JOBS_DIR / job_id).resolve()
+    if not path.is_relative_to(JOBS_DIR.resolve()):
+        raise InvalidJobId("Invalid job id")
+    return path
 
 
 def state_path(job_id: str) -> Path:
@@ -37,7 +48,7 @@ def safe_name(name: str) -> str:
 def read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return default
 
 

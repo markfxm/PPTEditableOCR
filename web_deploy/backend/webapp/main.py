@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core import OCRBox
@@ -15,6 +15,7 @@ from app.core import OCRBox
 from .storage import (
     box_to_dict,
     init_job,
+    InvalidJobId,
     job_dir,
     load_project,
     read_json,
@@ -65,6 +66,11 @@ class SlidePayload(BaseModel):
     watermark_rect: list[int] | None = None
 
 
+@app.exception_handler(InvalidJobId)
+def invalid_job_id_handler(_request, _exc: InvalidJobId) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "任务不存在"})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -74,8 +80,8 @@ def health() -> dict[str, str]:
 async def create_job(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> dict[str, Any]:
     filename = safe_name(file.filename or "upload")
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".pdf", ".pptx", ".ppt"}:
-        raise HTTPException(status_code=400, detail="只支持 PDF、PPTX 或 PPT 文件")
+    if suffix not in {".pdf", ".pptx"}:
+        raise HTTPException(status_code=400, detail="只支持 PDF 或 PPTX 文件")
 
     job_id = uuid.uuid4().hex
     root = init_job(job_id, filename)
@@ -165,7 +171,10 @@ def update_slide(job_id: str, slide_index: int, payload: SlidePayload) -> dict[s
     slides = [item for item in state.get("slides", []) if item.get("index") != slide.index]
     slides.append({"index": slide.index, "label": f"第{slide.index}页", "boxCount": len(slide.boxes), "status": "ok"})
     slides.sort(key=lambda item: item["index"])
-    update_state(job_id, status="ready", phase="可检查识别框并导出", slides=slides)
+    changes: dict[str, Any] = {"slides": slides}
+    if state.get("status") != "done":
+        changes.update(status="ready", phase="可检查识别框并导出")
+    update_state(job_id, **changes)
     return {"ok": True, "boxCount": len(slide.boxes)}
 
 

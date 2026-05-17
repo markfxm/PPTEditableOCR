@@ -58,8 +58,8 @@ def process_upload(job_id: str, upload_path: str) -> None:
             update_state(job_id, phase="PDF 转 PPT", progress=0)
             source_pptx = root / "work" / f"{source.stem}-from-pdf.pptx"
             convert_pdf_to_pptx(source, source_pptx, progress=lambda msg: _progress(job_id, msg))
-        elif source.suffix.lower() not in {".pptx", ".ppt"}:
-            raise RuntimeError("只支持 PDF、PPTX 或 PPT 文件")
+        elif source.suffix.lower() not in {".pptx"}:
+            raise RuntimeError("只支持 PDF 或 PPTX 文件")
 
         update_state(job_id, sourcePptx=str(source_pptx), phase="OCR 识别", progress=0)
         project = prepare_project(

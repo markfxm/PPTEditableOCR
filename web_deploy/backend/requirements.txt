@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+redis
+rq
+python-pptx
+pillow
+pypdfium2
+opencv-python-headless
+numpy
+iopaint
+paddleocr
+paddlex[ocr]
+huggingface_hub==0.25.2
+paddlepaddle==3.2.0

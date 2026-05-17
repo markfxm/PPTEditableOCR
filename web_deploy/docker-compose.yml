@@ -1,0 +1,41 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    command: python -m webapp.worker
+    environment:
+      DATA_DIR: /data
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+
+  nginx:
+    image: nginx:1.27
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api

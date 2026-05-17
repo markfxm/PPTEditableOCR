@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 project_root = Path.cwd()
 pathex = [
@@ -37,11 +37,33 @@ packages = [
     "yaml",
 ]
 
+ocr_dependency_packages = {
+    "beautifulsoup4": "bs4",
+    "ftfy": "ftfy",
+    "imagesize": "imagesize",
+    "latex2mathml": "latex2mathml",
+    "openpyxl": "openpyxl",
+    "premailer": "premailer",
+    "pyclipper": "pyclipper",
+    "pypdfium2": "pypdfium2",
+    "python-bidi": "bidi",
+    "scikit-learn": "sklearn",
+    "sentencepiece": "sentencepiece",
+    "shapely": "shapely",
+    "tiktoken": "tiktoken",
+    "tokenizers": "tokenizers",
+}
+
+packages += list(ocr_dependency_packages.values())
+
 for package in packages:
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
+
+for distribution in ocr_dependency_packages:
+    datas += copy_metadata(distribution)
 
 optional_datas = [
     (

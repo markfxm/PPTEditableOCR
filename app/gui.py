@@ -456,9 +456,16 @@ class MainWindow(QMainWindow):
         self.ocr_backend_combo.addItem("远端 PaddleOCR", OCR_BACKEND_REMOTE)
         self.ocr_backend_combo.currentIndexChanged.connect(self.on_ocr_backend_changed)
         ocr_layout.addRow("识别方式", self.ocr_backend_combo)
+        token_buttons = QWidget()
+        token_buttons_layout = QHBoxLayout(token_buttons)
+        token_buttons_layout.setContentsMargins(0, 0, 0, 0)
         self.ocr_token_btn = QPushButton("设置远端 OCR 令牌")
         self.ocr_token_btn.clicked.connect(self.configure_remote_ocr_token)
-        ocr_layout.addRow(self.ocr_token_btn)
+        token_buttons_layout.addWidget(self.ocr_token_btn)
+        self.delete_ocr_token_btn = QPushButton("删除远端 OCR 令牌")
+        self.delete_ocr_token_btn.clicked.connect(self.delete_remote_ocr_token)
+        token_buttons_layout.addWidget(self.delete_ocr_token_btn)
+        ocr_layout.addRow(token_buttons)
         self.ocr_token_status = QLabel("远端令牌未设置")
         self.ocr_token_status.setWordWrap(True)
         ocr_layout.addRow("远端令牌", self.ocr_token_status)
@@ -546,8 +553,9 @@ class MainWindow(QMainWindow):
         backend, token = self.current_ocr_config()
         has_token = bool(token and len(token) == REMOTE_OCR_TOKEN_LENGTH)
         self.ocr_token_btn.setEnabled(backend == OCR_BACKEND_REMOTE)
+        self.delete_ocr_token_btn.setEnabled(bool(token))
         if backend == OCR_BACKEND_LOCAL:
-            self.ocr_token_status.setText("当前使用本地 OCR")
+            self.ocr_token_status.setText("当前使用本地 OCR" if not token else "已保存令牌，当前使用本地 OCR")
         elif has_token:
             self.ocr_token_status.setText("已设置 40 位令牌")
         else:
@@ -571,6 +579,14 @@ class MainWindow(QMainWindow):
         self.settings.setValue("ocr/remote_token", token)
         self.update_ocr_token_status()
         QMessageBox.information(self, "完成", "远端 OCR 令牌已保存。")
+
+    def delete_remote_ocr_token(self):
+        self.settings.remove("ocr/remote_token")
+        local_index = self.ocr_backend_combo.findData(OCR_BACKEND_LOCAL)
+        self.ocr_backend_combo.setCurrentIndex(max(0, local_index))
+        self.settings.setValue("ocr/backend", OCR_BACKEND_LOCAL)
+        self.update_ocr_token_status()
+        QMessageBox.information(self, "完成", "远端 OCR 令牌已删除，后续 OCR 会使用本地 PaddleOCR。")
 
     def append_log(self, message: str):
         if message.startswith(PROGRESS_PREFIX):

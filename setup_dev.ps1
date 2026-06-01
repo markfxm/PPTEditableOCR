@@ -21,7 +21,7 @@ Install-Target ".py310gui" @(
 
 Install-Target ".py310iopaint" @(
     "iopaint",
-    "paddleocr",
+    "paddleocr>=3.6.0",
     "paddlex[ocr]",
     "huggingface_hub==0.25.2",
     "paddlepaddle==3.2.0"

@@ -24,6 +24,18 @@ import cv2
 import numpy as np
 from PIL import Image
 from paddleocr import PaddleOCR
+try:
+    from paddleocr import PaddleOCRClient
+except ImportError:
+    PaddleOCRClient = None
+try:
+    from paddleocr import Model
+except ImportError:
+    Model = None
+try:
+    from paddleocr import OCROptions
+except ImportError:
+    OCROptions = None
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
@@ -36,6 +48,9 @@ PROGRESS_PREFIX = "__PPTTOEDIT_PROGRESS__|"
 PAGE_READY_PREFIX = "__PPTTOEDIT_PAGE_READY__|"
 CACHE_VERSION = 1
 DEFAULT_PPT_WIDTH = Inches(13.333333)
+OCR_BACKEND_LOCAL = "local"
+OCR_BACKEND_REMOTE = "remote"
+REMOTE_OCR_TOKEN_LENGTH = 40
 
 
 def bundle_root() -> Path:
@@ -414,11 +429,94 @@ def extract_slide_images(source_pptx: Path, images_dir: Path, progress: Progress
     return src, extracted
 
 
-def run_ocr(slides: list[PPTSlide], progress: ProgressCB = None):
+def _make_remote_ocr_options():
+    if OCROptions is None:
+        return None
+    try:
+        return OCROptions(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            visualize=False,
+        )
+    except TypeError:
+        try:
+            return OCROptions(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        except TypeError:
+            return None
+
+
+def _result_attr(result, *names):
+    for name in names:
+        if isinstance(result, dict) and name in result:
+            return result[name]
+        if hasattr(result, name):
+            return getattr(result, name)
+    return None
+
+
+def _result_as_page_dict(page) -> dict:
+    pruned = _result_attr(page, "prunedResult", "pruned_result", "res")
+    if pruned is None and hasattr(page, "to_dict"):
+        try:
+            pruned = _result_attr(page.to_dict(), "prunedResult", "pruned_result", "res")
+        except Exception:
+            pruned = None
+    if pruned is None:
+        pruned = page
+    if hasattr(pruned, "to_dict"):
+        pruned = pruned.to_dict()
+    if not isinstance(pruned, dict):
+        raise RuntimeError(f"远端 OCR 返回格式不支持：{type(pruned).__name__}")
+    return {
+        "dt_polys": pruned.get("dt_polys") or pruned.get("dtPolys") or [],
+        "rec_texts": pruned.get("rec_texts") or pruned.get("recTexts") or [],
+        "rec_scores": pruned.get("rec_scores") or pruned.get("recScores") or [],
+    }
+
+
+def _predict_remote_ocr_page(client, image_path: Path) -> dict:
+    model = getattr(Model, "PP_OCRV5", "PP-OCRv5") if Model is not None else "PP-OCRv5"
+    kwargs = {
+        "file_path": str(image_path),
+        "model": model,
+    }
+    options = _make_remote_ocr_options()
+    if options is not None:
+        kwargs["options"] = options
+    try:
+        result = client.ocr(**kwargs)
+    except TypeError:
+        kwargs.pop("options", None)
+        result = client.ocr(**kwargs)
+    pages = _result_attr(result, "pages")
+    if not pages:
+        return {"dt_polys": [], "rec_texts": [], "rec_scores": []}
+    return _result_as_page_dict(pages[0])
+
+
+def run_ocr(
+    slides: list[PPTSlide],
+    progress: ProgressCB = None,
+    ocr_backend: str = OCR_BACKEND_LOCAL,
+    ocr_token: str | None = None,
+):
     det_dir = bundled_ocr_model_dir("PP-OCRv5_server_det")
     rec_dir = bundled_ocr_model_dir("PP-OCRv5_server_rec")
+    use_remote = ocr_backend == OCR_BACKEND_REMOTE
 
     def create_ocr():
+        if use_remote:
+            token = (ocr_token or os.environ.get("PADDLEOCR_ACCESS_TOKEN") or "").strip()
+            if len(token) != REMOTE_OCR_TOKEN_LENGTH:
+                raise RuntimeError("远端 OCR 需要 40 位访问令牌。")
+            if PaddleOCRClient is None:
+                raise RuntimeError("当前 PaddleOCR 版本不支持远端调用，请升级 paddleocr 后重试。")
+            return PaddleOCRClient(token=token)
         return PaddleOCR(
             lang="ch",
             use_doc_orientation_classify=False,
@@ -428,16 +526,22 @@ def run_ocr(slides: list[PPTSlide], progress: ProgressCB = None):
             text_recognition_model_dir=str(rec_dir) if rec_dir else None,
         )
 
+    _log(progress, "使用远端 PaddleOCR 识别" if use_remote else "使用本地 PaddleOCR 识别")
     ocr = create_ocr()
     for slide in slides:
         try:
-            page = ocr.predict(str(slide.image_path))[0]
+            if use_remote:
+                page = _predict_remote_ocr_page(ocr, slide.image_path)
+            else:
+                page = ocr.predict(str(slide.image_path))[0]
         except Exception as exc:
             _log(progress, f"第 {slide.index} 页 OCR 失败，已跳过该页，可稍后手动新增框：{exc}")
             _log(progress, traceback.format_exc())
             slide.boxes = []
             _page_ready(progress, slide, status="failed")
             try:
+                if use_remote and hasattr(ocr, "close"):
+                    ocr.close()
                 ocr = create_ocr()
             except Exception as reset_exc:
                 _log(progress, f"OCR 引擎重置失败，后续页面可能继续失败：{reset_exc}")
@@ -461,10 +565,16 @@ def run_ocr(slides: list[PPTSlide], progress: ProgressCB = None):
         slide.boxes = boxes
         _page_ready(progress, slide)
         _log(progress, f"第 {slide.index} 页 OCR 完成，共 {len(boxes)} 个框")
+    if use_remote and hasattr(ocr, "close"):
+        ocr.close()
 
 
 def prepare_project(
-    source_pptx: Path, work_dir: Path | None = None, progress: ProgressCB = None
+    source_pptx: Path,
+    work_dir: Path | None = None,
+    progress: ProgressCB = None,
+    ocr_backend: str = OCR_BACKEND_LOCAL,
+    ocr_token: str | None = None,
 ) -> PPTProject:
     source_pptx = source_pptx.expanduser().resolve()
     if work_dir is None:
@@ -488,13 +598,14 @@ def prepare_project(
         slide_height=src.slide_height,
     )
     if not load_project_cache(project, progress=progress):
-        run_ocr(slides, progress)
+        run_ocr(slides, progress, ocr_backend=ocr_backend, ocr_token=ocr_token)
     return project
 
 
 def build_masks(project: PPTProject, progress: ProgressCB = None):
     project.masks_dir.mkdir(parents=True, exist_ok=True)
-    for slide in project.slides:
+    total_slides = max(1, len(project.slides))
+    for done, slide in enumerate(project.slides, start=1):
         mask = np.zeros((slide.image_height, slide.image_width), dtype=np.uint8)
         for box in slide.boxes:
             if not box.enabled:
@@ -509,6 +620,7 @@ def build_masks(project: PPTProject, progress: ProgressCB = None):
         if not mask_path.exists():
             raise RuntimeError(f"擦除蒙版写入失败：{mask_path}")
         _log(progress, f"第 {slide.index} 页擦除蒙版已生成")
+        _progress(progress, int(done * 100 / total_slides), f"生成擦除蒙版：{done}/{total_slides}")
 
 
 def os_environ_with_pythonpath():
@@ -685,7 +797,9 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
         del out.slides._sldIdLst[0]
 
     blank = out.slide_layouts[6]
-    for slide_data in project.slides:
+    total_slides = max(1, len(project.slides))
+    for done, slide_data in enumerate(project.slides, start=1):
+        _progress(progress, int((done - 1) * 100 / total_slides), f"重建可编辑文本框：{done}/{total_slides}")
         cleaned_path = cleaned_image_path(project.cleaned_dir, slide_data.image_name)
         color_image = Image.open(slide_data.image_path).convert("RGB")
         cleaned_image = Image.open(cleaned_path).convert("RGB")
@@ -704,7 +818,9 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
             if add_textbox(dst, color_image, box, x_scale, y_scale):
                 count += 1
         _log(progress, f"第 {slide_data.index} 页已重建 {count} 个可编辑文本框")
+        _progress(progress, int(done * 100 / total_slides), f"重建可编辑文本框：{done}/{total_slides}")
     output_pptx.parent.mkdir(parents=True, exist_ok=True)
+    _progress(progress, 100, "正在保存 PPT 文件...")
     out.save(str(output_pptx))
     _log(progress, f"已导出：{output_pptx}")
 

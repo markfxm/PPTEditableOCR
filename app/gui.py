@@ -10,11 +10,12 @@ for deps_name in [".py310gui", ".py310iopaint", ".py310deps"]:
     if deps.exists() and str(deps) not in sys.path:
         sys.path.insert(0, str(deps))
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -49,8 +51,11 @@ from .core import (
     export_editable_ppt,
     prepare_project,
     save_project_cache,
+    OCR_BACKEND_LOCAL,
+    OCR_BACKEND_REMOTE,
     PAGE_READY_PREFIX,
     PROGRESS_PREFIX,
+    REMOTE_OCR_TOKEN_LENGTH,
 )
 
 BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, int, int], bool, bool, bool, int]]
@@ -368,6 +373,8 @@ class ManualDialog(QDialog):
 
 class MainWindow(QMainWindow):
     MAX_UNDO_STEPS = 50
+    SETTINGS_ORG = "PPTtoEdit"
+    SETTINGS_APP = "PPTEditableOCR"
 
     def __init__(self):
         super().__init__()
@@ -385,8 +392,10 @@ class MainWindow(QMainWindow):
         self.selecting_ppt_list_item = False
         self.pending_autoload_ppt: Path | None = None
         self.pending_pdf_loaded_notice: Path | None = None
+        self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
 
         self._build_ui()
+        self.load_ocr_settings()
 
     def _build_ui(self):
         toolbar = QToolBar("Main")
@@ -439,6 +448,21 @@ class MainWindow(QMainWindow):
         self.ppt_file_list.currentRowChanged.connect(self.on_ppt_file_selected)
         ppt_group_layout.addWidget(self.ppt_file_list)
         side_layout.addWidget(ppt_group)
+
+        ocr_group = QGroupBox("OCR 设置")
+        ocr_layout = QFormLayout(ocr_group)
+        self.ocr_backend_combo = QComboBox()
+        self.ocr_backend_combo.addItem("本地 PaddleOCR", OCR_BACKEND_LOCAL)
+        self.ocr_backend_combo.addItem("远端 PaddleOCR", OCR_BACKEND_REMOTE)
+        self.ocr_backend_combo.currentIndexChanged.connect(self.on_ocr_backend_changed)
+        ocr_layout.addRow("识别方式", self.ocr_backend_combo)
+        self.ocr_token_btn = QPushButton("设置远端 OCR 令牌")
+        self.ocr_token_btn.clicked.connect(self.configure_remote_ocr_token)
+        ocr_layout.addRow(self.ocr_token_btn)
+        self.ocr_token_status = QLabel("远端令牌未设置")
+        self.ocr_token_status.setWordWrap(True)
+        ocr_layout.addRow("远端令牌", self.ocr_token_status)
+        side_layout.addWidget(ocr_group)
 
         form = QFormLayout()
         self.pad_x = QSpinBox()
@@ -500,20 +524,72 @@ class MainWindow(QMainWindow):
         root.addWidget(side)
         root.setStretchFactor(1, 1)
 
+    def load_ocr_settings(self):
+        backend = self.settings.value("ocr/backend", OCR_BACKEND_LOCAL)
+        if backend not in {OCR_BACKEND_LOCAL, OCR_BACKEND_REMOTE}:
+            backend = OCR_BACKEND_LOCAL
+        index = self.ocr_backend_combo.findData(backend)
+        self.ocr_backend_combo.setCurrentIndex(max(0, index))
+        self.update_ocr_token_status()
+
+    def current_ocr_config(self) -> tuple[str, str | None]:
+        backend = self.ocr_backend_combo.currentData() or OCR_BACKEND_LOCAL
+        token = str(self.settings.value("ocr/remote_token", "") or "").strip()
+        return backend, token if token else None
+
+    def on_ocr_backend_changed(self, _index: int = 0):
+        backend = self.ocr_backend_combo.currentData() or OCR_BACKEND_LOCAL
+        self.settings.setValue("ocr/backend", backend)
+        self.update_ocr_token_status()
+
+    def update_ocr_token_status(self):
+        backend, token = self.current_ocr_config()
+        has_token = bool(token and len(token) == REMOTE_OCR_TOKEN_LENGTH)
+        self.ocr_token_btn.setEnabled(backend == OCR_BACKEND_REMOTE)
+        if backend == OCR_BACKEND_LOCAL:
+            self.ocr_token_status.setText("当前使用本地 OCR")
+        elif has_token:
+            self.ocr_token_status.setText("已设置 40 位令牌")
+        else:
+            self.ocr_token_status.setText("远端令牌未设置或长度不是 40 位")
+
+    def configure_remote_ocr_token(self):
+        current = str(self.settings.value("ocr/remote_token", "") or "").strip()
+        token, accepted = QInputDialog.getText(
+            self,
+            "远端 OCR 令牌",
+            "请输入 40 位 PaddleOCR 访问令牌：",
+            QLineEdit.EchoMode.Password,
+            current,
+        )
+        if not accepted:
+            return
+        token = token.strip()
+        if len(token) != REMOTE_OCR_TOKEN_LENGTH:
+            QMessageBox.warning(self, "令牌无效", "远端 OCR 访问令牌长度必须是 40 位。")
+            return
+        self.settings.setValue("ocr/remote_token", token)
+        self.update_ocr_token_status()
+        QMessageBox.information(self, "完成", "远端 OCR 令牌已保存。")
+
     def append_log(self, message: str):
         if message.startswith(PROGRESS_PREFIX):
             _prefix, percent, text = message.split("|", 2)
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(int(percent))
             self.progress_label.setText(text)
+            QApplication.processEvents()
             return
         if message.startswith(PAGE_READY_PREFIX):
             parts = message.split("|", 3)
             _prefix, index, box_count = parts[:3]
             status = parts[3] if len(parts) > 3 else "ok"
             self.upsert_slide_list_item(int(index), int(box_count), status)
+            QApplication.processEvents()
             return
         self.log.appendPlainText(message)
+        self.log.ensureCursorVisible()
+        QApplication.processEvents()
 
     def upsert_slide_list_item(self, slide_index: int, box_count: int, status: str = "ok"):
         row = slide_index - 1
@@ -627,6 +703,10 @@ class MainWindow(QMainWindow):
         source = path.expanduser().resolve()
         if self.worker_thread:
             return
+        ocr_backend, ocr_token = self.current_ocr_config()
+        if ocr_backend == OCR_BACKEND_REMOTE and not (ocr_token and len(ocr_token) == REMOTE_OCR_TOKEN_LENGTH):
+            QMessageBox.information(self, "提示", "使用远端 OCR 前，请先点击“设置远端 OCR 令牌”并输入 40 位令牌。")
+            return
         if add_to_list:
             self.add_ppt_to_recent_list(source, select=select_in_list)
         self.project = None
@@ -639,7 +719,13 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.save_cache_action.setEnabled(False)
         self.append_log(f"开始加载：{source}")
-        self.run_worker(prepare_project, self.on_project_loaded, source)
+        self.run_worker(
+            prepare_project,
+            self.on_project_loaded,
+            source,
+            ocr_backend=ocr_backend,
+            ocr_token=ocr_token,
+        )
 
     def on_ppt_file_selected(self, row: int):
         if self.selecting_ppt_list_item or self.worker_thread:

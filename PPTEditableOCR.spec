@@ -16,6 +16,61 @@ datas = []
 binaries = []
 hiddenimports = []
 
+excluded_path_parts = {
+    "__pycache__",
+    "tests",
+    "testing",
+    "test",
+    "docs",
+    "doc",
+    "examples",
+    "example",
+    "include",
+    "glue",
+}
+
+excluded_suffixes = {
+    ".a",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".lib",
+    ".pxd",
+    ".pyx",
+    ".rst",
+}
+
+excluded_prefixes = {
+    "PySide6/qml",
+}
+
+
+def should_exclude(path):
+    normalized = str(path).replace("\\", "/")
+    lower = normalized.lower()
+    parts = set(lower.split("/"))
+
+    if parts & excluded_path_parts:
+        return True
+    if any(lower.startswith(prefix.lower()) for prefix in excluded_prefixes):
+        return True
+    if Path(lower).suffix in excluded_suffixes:
+        return True
+
+    return False
+
+
+def filter_entries(entries):
+    return [
+        (source, target)
+        for source, target in entries
+        if not should_exclude(source) and not should_exclude(target)
+    ]
+
 packages = [
     "PySide6",
     "paddleocr",
@@ -58,9 +113,20 @@ packages += list(ocr_dependency_packages.values())
 
 for package in packages:
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package)
-    datas += pkg_datas
-    binaries += pkg_binaries
-    hiddenimports += pkg_hiddenimports
+    datas += filter_entries(pkg_datas)
+    binaries += filter_entries(pkg_binaries)
+
+hiddenimports += [
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "paddleocr._api_client",
+    "iopaint.download",
+    "iopaint.helper",
+    "iopaint.model_manager",
+    "iopaint.model.utils",
+    "iopaint.schema",
+]
 
 for distribution in ocr_dependency_packages:
     datas += copy_metadata(distribution)

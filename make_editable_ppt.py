@@ -5,14 +5,20 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from app.core import export_editable_ppt, prepare_project
+from app.core import convert_pdf_to_pptx, export_editable_ppt, prepare_project
 
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit("usage: python make_editable_ppt.py <source.pptx> [output.pptx]")
+        raise SystemExit("usage: python make_editable_ppt.py <source.pptx|source.pdf> [output.pptx]")
 
-    source_pptx = Path(sys.argv[1]).expanduser().resolve()
+    source = Path(sys.argv[1]).expanduser().resolve()
+    source_pptx = source
+    if source.suffix.lower() == ".pdf":
+        source_pptx = convert_pdf_to_pptx(source, progress=print)
+    elif source.suffix.lower() != ".pptx":
+        raise SystemExit("source must be a .pptx or .pdf file")
+
     output_pptx = (
         Path(sys.argv[2]).expanduser().resolve()
         if len(sys.argv) >= 3

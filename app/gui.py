@@ -57,7 +57,7 @@ from .core import (
     PROGRESS_PREFIX,
     REMOTE_OCR_TOKEN_LENGTH,
 )
-from .ocr_config import resolve_ocr_config
+from .ocr_config import resolve_ocr_config, should_clear_paused_ocr_request
 
 BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, int, int], bool, bool, bool, int]]
 
@@ -768,6 +768,9 @@ class MainWindow(QMainWindow):
         source = path.expanduser().resolve()
         if self.worker_thread:
             return
+        if should_clear_paused_ocr_request(force_local_ocr):
+            self.paused_ocr_request = None
+            self.continue_ocr_btn.setEnabled(False)
         if force_local_ocr:
             ocr_backend, ocr_token = OCR_BACKEND_LOCAL, None
         else:

@@ -710,6 +710,52 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
     _log(progress, "IOPaint 擦除完成")
 
 
+def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: ProgressCB = None) -> int:
+    if scale <= 1:
+        _log(progress, "RealESRGAN 清晰化已跳过")
+        return 0
+
+    image_paths = [
+        path
+        for path in sorted(cleaned_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    ]
+    if not image_paths:
+        _log(progress, f"没有找到待清晰化图片：{cleaned_dir}")
+        return 0
+
+    env = os_environ_with_pythonpath()
+    for key in ("XDG_CACHE_HOME", "U2NET_HOME", "PYTHONPATH"):
+        if key in env:
+            os.environ[key] = env[key]
+
+    from iopaint.model.utils import torch_gc
+    from iopaint.plugins import RealESRGANUpscaler
+    from iopaint.schema import Device, RunPluginRequest
+
+    _log(progress, "开始用 RealESRGAN 提升导出底图清晰度")
+    _progress(progress, 0, f"RealESRGAN 清晰化处理中：0/{len(image_paths)}")
+    upscaler = RealESRGANUpscaler("realesr-general-x4v3", Device.cpu, no_half=True)
+
+    for done, image_path in enumerate(image_paths, start=1):
+        with Image.open(image_path) as source_image:
+            infos = source_image.info
+            rgb_image = np.array(source_image.convert("RGB"))
+
+        bgr_result = upscaler.gen_image(
+            rgb_image,
+            RunPluginRequest(name=RealESRGANUpscaler.name, image="", scale=scale),
+        )
+        rgb_result = cv2.cvtColor(bgr_result, cv2.COLOR_BGR2RGB)
+        output_format = "JPEG" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
+        Image.fromarray(rgb_result).save(image_path, format=output_format, **infos)
+        torch_gc()
+        _progress(progress, int(done * 100 / len(image_paths)), f"RealESRGAN 清晰化处理中：{done}/{len(image_paths)}")
+
+    _log(progress, "RealESRGAN 清晰化完成")
+    return len(image_paths)
+
+
 def cleaned_image_path(cleaned_dir: Path, name: str):
     nested = cleaned_dir / name / name.replace("_clean", "")
     if nested.exists():
@@ -802,7 +848,6 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
         _progress(progress, int((done - 1) * 100 / total_slides), f"重建可编辑文本框：{done}/{total_slides}")
         cleaned_path = cleaned_image_path(project.cleaned_dir, slide_data.image_name)
         color_image = Image.open(slide_data.image_path).convert("RGB")
-        cleaned_image = Image.open(cleaned_path).convert("RGB")
         dst = out.slides.add_slide(blank)
         dst.shapes.add_picture(
             str(cleaned_path),
@@ -811,8 +856,8 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
             width=out.slide_width,
             height=out.slide_height,
         )
-        x_scale = out.slide_width / cleaned_image.width
-        y_scale = out.slide_height / cleaned_image.height
+        x_scale = out.slide_width / slide_data.image_width
+        y_scale = out.slide_height / slide_data.image_height
         count = 0
         for box in slide_data.boxes:
             if add_textbox(dst, color_image, box, x_scale, y_scale):
@@ -828,4 +873,5 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
 def export_editable_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = None):
     build_masks(project, progress)
     run_iopaint(project.images_dir, project.masks_dir, project.cleaned_dir, progress)
+    upscale_cleaned_images(project.cleaned_dir, progress=progress)
     rebuild_ppt(project, output_pptx, progress)

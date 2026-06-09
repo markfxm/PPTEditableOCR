@@ -126,6 +126,8 @@ hiddenimports += [
     "iopaint.helper",
     "iopaint.model_manager",
     "iopaint.model.utils",
+    "iopaint.plugins",
+    "iopaint.plugins.realesrgan",
     "iopaint.schema",
 ]
 
@@ -135,6 +137,10 @@ for distribution in ocr_dependency_packages:
 optional_datas = [
     (
         Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "big-lama.pt",
+        "models/torch/hub/checkpoints",
+    ),
+    (
+        Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "realesr-general-x4v3.pth",
         "models/torch/hub/checkpoints",
     ),
     (

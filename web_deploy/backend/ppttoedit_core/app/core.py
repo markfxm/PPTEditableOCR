@@ -575,6 +575,7 @@ def prepare_project(
     progress: ProgressCB = None,
     ocr_backend: str = OCR_BACKEND_LOCAL,
     ocr_token: str | None = None,
+    auto_ocr: bool = True,
 ) -> PPTProject:
     source_pptx = source_pptx.expanduser().resolve()
     if work_dir is None:
@@ -597,7 +598,7 @@ def prepare_project(
         slide_width=src.slide_width,
         slide_height=src.slide_height,
     )
-    if not load_project_cache(project, progress=progress):
+    if not load_project_cache(project, progress=progress) and auto_ocr:
         run_ocr(slides, progress, ocr_backend=ocr_backend, ocr_token=ocr_token)
     return project
 
@@ -870,8 +871,16 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
     _log(progress, f"已导出：{output_pptx}")
 
 
-def export_editable_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = None):
+def export_editable_ppt(
+    project: PPTProject,
+    output_pptx: Path,
+    progress: ProgressCB = None,
+    enhance_images: bool = True,
+):
     build_masks(project, progress)
     run_iopaint(project.images_dir, project.masks_dir, project.cleaned_dir, progress)
-    upscale_cleaned_images(project.cleaned_dir, progress=progress)
+    if enhance_images:
+        upscale_cleaned_images(project.cleaned_dir, progress=progress)
+    else:
+        _log(progress, "已跳过 RealESRGAN 底图清晰化")
     rebuild_ppt(project, output_pptx, progress)

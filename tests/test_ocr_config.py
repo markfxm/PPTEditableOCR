@@ -1,6 +1,6 @@
 import unittest
 
-from app.ocr_config import resolve_ocr_config, should_clear_paused_ocr_request
+from app.ocr_config import resolve_ocr_config
 
 
 class ResolveOcrConfigTest(unittest.TestCase):
@@ -29,10 +29,6 @@ class ResolveOcrConfigTest(unittest.TestCase):
         self.assertEqual(backend, "remote")
         self.assertEqual(token, "x" * 40)
         self.assertIsNone(fallback_message)
-
-    def test_new_load_clears_paused_request_but_resume_does_not(self):
-        self.assertTrue(should_clear_paused_ocr_request(force_local_ocr=False))
-        self.assertFalse(should_clear_paused_ocr_request(force_local_ocr=True))
 
 
 if __name__ == "__main__":

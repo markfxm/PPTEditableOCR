@@ -50,6 +50,7 @@ from .core import (
     convert_pdf_to_pptx,
     export_editable_ppt,
     prepare_project,
+    run_ocr,
     save_project_cache,
     OCR_BACKEND_LOCAL,
     OCR_BACKEND_REMOTE,
@@ -57,7 +58,7 @@ from .core import (
     PROGRESS_PREFIX,
     REMOTE_OCR_TOKEN_LENGTH,
 )
-from .ocr_config import resolve_ocr_config, should_clear_paused_ocr_request
+from .ocr_config import resolve_ocr_config
 
 BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, int, int], bool, bool, bool, int]]
 
@@ -235,11 +236,13 @@ class ManualDialog(QDialog):
     SECTIONS = [
         (
             "基本流程",
-            """1. 如果源文件是 PDF，先点击“打开 PDF”，生成每页一张整页图片的 PPT。
+            """PPT 预览区上方会显示完整流程，提示每一步该做什么。
+
+1. 如果源文件是 PDF，先点击“打开 PDF”，生成每页一张整页图片的 PPT。
 2. 点击“打开 PPT”，导入图片型 PPT。
-3. 程序会提取每页图片，并用 OCR 自动识别文字区域。
-4. 在中间画布检查蓝色文字框，必要时调整、删除或新增框。
-5. 点击“导出可编辑 PPT”，程序会先保存识别框、擦除原图文字、清晰化底图，再重建可编辑文本框。""",
+3. 程序会提取每页图片；请先在右侧选择本地或远端 OCR，再点击“开始 OCR（按当前选择）”识别文字区域。
+4. OCR 完成后，在中间画布检查蓝色文字框，必要时调整、删除或新增框。
+5. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。""",
         ),
         (
             "PDF 转 PPT",
@@ -314,16 +317,16 @@ class ManualDialog(QDialog):
 令牌管理：
 点击“设置远端 OCR 令牌”可以保存令牌；点击“删除远端 OCR 令牌”会清除令牌，并自动切回本地 OCR。
 
-继续 OCR（本地）：
-如果选择远端 OCR 但令牌缺失或长度不正确，本次加载会暂停。点击“继续 OCR（本地）”可以用本地 PaddleOCR 继续识别当前文件。""",
+开始 OCR：
+打开 PPT 或 PDF 转换完成后，程序只提取页面图片，不会自动 OCR。请确认识别方式后点击“开始 OCR（按当前选择）”。如果选择远端 OCR 但令牌缺失或长度不正确，会提示先设置令牌或切换为本地 OCR。""",
         ),
         (
             "导出与清晰化",
             """导出顺序：
-点击“导出可编辑 PPT”后，程序会先自动保存识别框，然后生成擦除蒙版，用 IOPaint/LaMa 擦除原图文字，再用 RealESRGAN 对清底图做 2x 清晰化，最后重建可编辑文本框并保存 PPT。
+点击“导出可编辑 PPT”后，程序会先自动保存识别框，然后生成擦除蒙版，用 IOPaint/LaMa 擦除原图文字。若勾选“导出时清晰化底图（RealESRGAN）”，会再对清底图做 2x 清晰化，最后重建可编辑文本框并保存 PPT。
 
 清晰化说明：
-RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等于还原真实原始细节。页数多或图片较大时，导出会比以前更慢。
+RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等于还原真实原始细节。页数多或图片较大时，导出会更慢；不需要时可以取消勾选。
 
 文字位置：
 底图清晰化后像素尺寸会变大，但文本框仍按原始页面坐标映射，避免导出的文字位置缩偏。""",
@@ -418,7 +421,6 @@ class MainWindow(QMainWindow):
         self.selecting_ppt_list_item = False
         self.pending_autoload_ppt: Path | None = None
         self.current_export_output: Path | None = None
-        self.paused_ocr_request: tuple[Path, bool, bool] | None = None
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
 
         self._build_ui()
@@ -449,8 +451,13 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.undo_action)
         toolbar.addAction(manual_action)
 
+        main = QWidget()
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(8, 6, 8, 8)
+        main_layout.setSpacing(6)
         root = QSplitter()
-        self.setCentralWidget(root)
+        main_layout.addWidget(root, 1)
+        self.setCentralWidget(main)
 
         self.slide_list = QListWidget()
         self.slide_list.currentRowChanged.connect(self.on_slide_changed)
@@ -458,6 +465,15 @@ class MainWindow(QMainWindow):
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
+        self.flow_label = QLabel()
+        self.flow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.flow_label.setWordWrap(True)
+        self.flow_label.setStyleSheet(
+            "QLabel { color: #24292f; background: #f6f8fa; border: 1px solid #d0d7de; "
+            "border-radius: 6px; padding: 8px; }"
+        )
+        center_layout.addWidget(self.flow_label)
+        self.set_flow_text()
         self.scene = SlideScene()
         self.scene.selection_changed.connect(self.on_scene_selection_changed)
         self.view = PPTGraphicsView()
@@ -492,11 +508,11 @@ class MainWindow(QMainWindow):
         self.delete_ocr_token_btn = QPushButton("删除远端 OCR 令牌")
         self.delete_ocr_token_btn.clicked.connect(self.delete_remote_ocr_token)
         token_buttons_layout.addWidget(self.delete_ocr_token_btn)
-        self.continue_ocr_btn = QPushButton("继续 OCR（本地）")
-        self.continue_ocr_btn.clicked.connect(self.continue_ocr_with_local)
-        self.continue_ocr_btn.setEnabled(False)
-        token_buttons_layout.addWidget(self.continue_ocr_btn)
         ocr_layout.addRow(token_buttons)
+        self.start_ocr_btn = QPushButton("开始 OCR（按当前选择）")
+        self.start_ocr_btn.clicked.connect(self.start_ocr)
+        self.start_ocr_btn.setEnabled(False)
+        ocr_layout.addRow(self.start_ocr_btn)
         self.ocr_token_status = QLabel("远端令牌未设置")
         self.ocr_token_status.setWordWrap(True)
         ocr_layout.addRow("远端令牌", self.ocr_token_status)
@@ -556,11 +572,26 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         side_layout.addWidget(self.progress_bar)
 
+        self.enhance_images_cb = QCheckBox("导出时清晰化底图（RealESRGAN）")
+        self.enhance_images_cb.setChecked(True)
+        side_layout.addWidget(self.enhance_images_cb)
+
+        self.continue_export_btn = QPushButton("继续：导出可编辑 PPT")
+        self.continue_export_btn.clicked.connect(self.export_ppt)
+        self.continue_export_btn.setEnabled(False)
+        side_layout.addWidget(self.continue_export_btn)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         side_layout.addWidget(self.log, 1)
         root.addWidget(side)
         root.setStretchFactor(1, 1)
+
+    def set_flow_text(self):
+        self.flow_label.setText(
+            "1. 打开 PPT/PDF --> 2. 选择 OCR 方式并识别 --> "
+            "3. 检查识别框 --> 4. 选择是否清晰化 --> 5. 导出可编辑 PPT"
+        )
 
     def load_ocr_settings(self):
         backend = self.settings.value("ocr/backend", OCR_BACKEND_LOCAL)
@@ -629,26 +660,6 @@ class MainWindow(QMainWindow):
         self.update_ocr_token_status()
         QMessageBox.information(self, "完成", "远端 OCR 令牌已删除，后续 OCR 会使用本地 PaddleOCR。")
 
-    def pause_ocr_request(self, source: Path, add_to_list: bool, select_in_list: bool, message: str):
-        self.paused_ocr_request = (source, add_to_list, select_in_list)
-        self.continue_ocr_btn.setEnabled(True)
-        self.append_log(f"{message} 请点击“继续 OCR（本地）”。")
-        QMessageBox.information(self, "OCR 暂停", f"{message}\n\n可点击右侧“继续 OCR（本地）”继续识别。")
-
-    def continue_ocr_with_local(self):
-        if not self.paused_ocr_request:
-            return
-        source, add_to_list, select_in_list = self.paused_ocr_request
-        self.paused_ocr_request = None
-        self.continue_ocr_btn.setEnabled(False)
-        self.append_log("继续 OCR：使用本地 PaddleOCR")
-        self.load_ppt_path(
-            source,
-            add_to_list=add_to_list,
-            select_in_list=select_in_list,
-            force_local_ocr=True,
-        )
-
     def append_log(self, message: str):
         if message.startswith(PROGRESS_PREFIX):
             _prefix, percent, text = message.split("|", 2)
@@ -688,7 +699,8 @@ class MainWindow(QMainWindow):
         self.toggle_box_cb.setEnabled(not busy)
         self.watermark_cb.setEnabled(not busy)
         self.text_edit.setEnabled(not busy)
-        self.continue_ocr_btn.setEnabled((not busy) and self.paused_ocr_request is not None)
+        self.start_ocr_btn.setEnabled((not busy) and self.project is not None)
+        self.continue_export_btn.setEnabled((not busy) and self.project is not None)
         self.save_cache_action.setEnabled((not busy) and self.project is not None)
         if busy:
             self.progress_label.setText("运行中...")
@@ -758,7 +770,7 @@ class MainWindow(QMainWindow):
         self.append_log(f"PDF 转 PPT 完成：{output_pptx}")
         self.add_ppt_to_recent_list(output_pptx, select=True)
         self.pending_autoload_ppt = output_pptx
-        self.append_log("PDF 转 PPT 完成，继续自动 OCR 识别")
+        self.append_log("PDF 转 PPT 完成，请选择 OCR 方式后点击“开始 OCR（按当前选择）”。")
         QTimer.singleShot(0, self.run_pending_work)
 
     def open_ppt(self):
@@ -788,23 +800,9 @@ class MainWindow(QMainWindow):
         path: Path,
         add_to_list: bool = True,
         select_in_list: bool = True,
-        force_local_ocr: bool = False,
     ):
         source = path.expanduser().resolve()
         if self.worker_thread:
-            return
-        if should_clear_paused_ocr_request(force_local_ocr):
-            self.paused_ocr_request = None
-            self.continue_ocr_btn.setEnabled(False)
-        if force_local_ocr:
-            ocr_backend, ocr_token = OCR_BACKEND_LOCAL, None
-        else:
-            ocr_backend, ocr_token, fallback_message = self.resolved_ocr_config()
-            if fallback_message:
-                self.pause_ocr_request(source, add_to_list, select_in_list, fallback_message)
-                return
-        if ocr_backend == OCR_BACKEND_REMOTE and not (ocr_token and len(ocr_token) == REMOTE_OCR_TOKEN_LENGTH):
-            self.pause_ocr_request(source, add_to_list, select_in_list, "远端 OCR 令牌未设置或长度不正确。")
             return
         if add_to_list:
             self.add_ppt_to_recent_list(source, select=select_in_list)
@@ -822,9 +820,59 @@ class MainWindow(QMainWindow):
             prepare_project,
             self.on_project_loaded,
             source,
+            auto_ocr=False,
+        )
+
+    def start_ocr(self):
+        if not self.project:
+            QMessageBox.information(self, "提示", "请先打开一个 PPT。")
+            return
+        ocr_backend, ocr_token, fallback_message = self.resolved_ocr_config()
+        if fallback_message:
+            QMessageBox.information(
+                self,
+                "OCR 未开始",
+                f"{fallback_message}\n\n请设置远端 OCR 令牌，或切换为本地 PaddleOCR 后重试。",
+            )
+            return
+        if ocr_backend == OCR_BACKEND_REMOTE and not (ocr_token and len(ocr_token) == REMOTE_OCR_TOKEN_LENGTH):
+            QMessageBox.information(
+                self,
+                "OCR 未开始",
+                "远端 OCR 令牌未设置或长度不正确。\n\n请设置远端 OCR 令牌，或切换为本地 PaddleOCR 后重试。",
+            )
+            return
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.append_log("开始 OCR 识别")
+        self.run_worker(
+            run_ocr,
+            self.on_ocr_finished,
+            self.project.slides,
             ocr_backend=ocr_backend,
             ocr_token=ocr_token,
         )
+
+    def on_ocr_finished(self, _result):
+        if not self.project:
+            return
+        current_index = self.current_slide.index if self.current_slide else 1
+        self.slide_list.clear()
+        for slide in self.project.slides:
+            item = QListWidgetItem(page_list_text(slide.index, len(slide.boxes)))
+            self.slide_list.addItem(item)
+        if self.project.slides:
+            row = max(0, min(current_index - 1, len(self.project.slides) - 1))
+            self.slide_list.setCurrentRow(row)
+            self.current_slide = self.project.slides[row]
+            self.render_current_slide()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.progress_label.setText("OCR 完成，请检查识别框，然后点击“继续：导出可编辑 PPT”。")
+        self.append_log("OCR 完成")
+        self.start_ocr_btn.setEnabled(True)
+        self.save_current_cache(show_message=False)
+        self.update_undo_action()
 
     def on_ppt_file_selected(self, row: int):
         if self.selecting_ppt_list_item or self.worker_thread:
@@ -848,8 +896,13 @@ class MainWindow(QMainWindow):
         self.append_log("项目加载完成")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.progress_label.setText("项目加载完成")
+        if any(slide.boxes for slide in project.slides):
+            self.progress_label.setText("项目加载完成，已加载识别框。请检查后点击“继续：导出可编辑 PPT”。")
+        else:
+            self.progress_label.setText("项目加载完成，请选择 OCR 方式后点击“开始 OCR（按当前选择）”。")
         self.save_cache_action.setEnabled(True)
+        self.start_ocr_btn.setEnabled(True)
+        self.continue_export_btn.setEnabled(True)
         self.update_undo_action()
 
     def save_current_cache(self, show_message: bool = True):
@@ -1109,7 +1162,13 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("准备导出")
         self.save_current_cache(show_message=False)
         self.append_log("开始导出可编辑 PPT")
-        self.run_worker(export_editable_ppt, self.on_export_finished, self.project, out_path)
+        self.run_worker(
+            export_editable_ppt,
+            self.on_export_finished,
+            self.project,
+            out_path,
+            enhance_images=self.enhance_images_cb.isChecked(),
+        )
 
     def on_export_finished(self, _result):
         output = self.current_export_output

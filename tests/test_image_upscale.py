@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from PIL import Image
 
-from app.core import OCRBox, PPTProject, PPTSlide, rebuild_ppt, upscale_cleaned_images
+from app.core import OCRBox, PPTProject, PPTSlide, export_editable_ppt, rebuild_ppt, upscale_cleaned_images
 
 
 class UpscaleCleanedImagesTest(unittest.TestCase):
@@ -111,6 +111,29 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             deck = Presentation(str(output_path))
             text_shape = next(shape for shape in deck.slides[0].shapes if getattr(shape, "text", "") == "Hello")
             self.assertEqual(text_shape.left, 457200)
+
+    def test_export_can_skip_realesrgan_enhancement(self):
+        project = PPTProject(
+            source_pptx=Path("source.pptx"),
+            work_dir=Path("work"),
+            images_dir=Path("images"),
+            masks_dir=Path("masks"),
+            cleaned_dir=Path("cleaned"),
+            slides=[],
+            slide_width=914400,
+            slide_height=914400,
+        )
+        messages = []
+        with (
+            unittest.mock.patch("app.core.build_masks"),
+            unittest.mock.patch("app.core.run_iopaint"),
+            unittest.mock.patch("app.core.upscale_cleaned_images") as upscale,
+            unittest.mock.patch("app.core.rebuild_ppt"),
+        ):
+            export_editable_ppt(project, Path("out.pptx"), progress=messages.append, enhance_images=False)
+
+        upscale.assert_not_called()
+        self.assertIn("已跳过 RealESRGAN 底图清晰化", messages)
 
 
 if __name__ == "__main__":

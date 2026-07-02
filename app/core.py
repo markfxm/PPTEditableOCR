@@ -815,7 +815,8 @@ def save_compressed_cleaned_image(image: Image.Image, source_path: Path, quality
     icc_profile = image.info.get("icc_profile")
     if icc_profile:
         save_kwargs["icc_profile"] = icc_profile
-    image.convert("RGB").save(output_path, **save_kwargs)
+    rgb_image = image if image.mode == "RGB" else image.convert("RGB")
+    rgb_image.save(output_path, **save_kwargs)
     return output_path
 
 

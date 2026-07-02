@@ -19,6 +19,7 @@ from app.core import (
     preferred_paddleocr_device,
     rebuild_ppt,
     run_iopaint,
+    save_compressed_cleaned_image,
     upscale_cleaned_images,
 )
 
@@ -161,6 +162,17 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             Image.new("RGB", (10, 10), (255, 255, 255)).save(jpeg_path, format="JPEG")
 
             self.assertEqual(cleaned_image_path(cleaned_dir, "slide_01.png"), jpeg_path)
+
+    def test_save_compressed_cleaned_image_does_not_convert_existing_rgb_images(self):
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "slide_01.png"
+            image = Image.new("RGB", (4, 4), (255, 255, 255))
+
+            with unittest.mock.patch.object(Image.Image, "convert", wraps=image.convert) as convert:
+                output_path = save_compressed_cleaned_image(image, source_path)
+
+            self.assertTrue(output_path.exists())
+            convert.assert_not_called()
 
     def test_iopaint_logs_each_generated_cleaned_page(self):
         with TemporaryDirectory() as temp_dir:

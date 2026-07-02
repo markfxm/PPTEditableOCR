@@ -49,6 +49,7 @@ def prefer_system_cuda_torch(
         cuda = getattr(torch_module, "cuda", None)
         is_available = getattr(cuda, "is_available", None)
         if callable(is_available) and is_available():
+            import_module("torchvision")
             return True
     except Exception:
         pass
@@ -764,38 +765,50 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
         _log(progress, "本机未找到 IOPaint lama 模型，开始准备模型")
         cli_download_model("lama")
 
-    device = preferred_iopaint_device(Device)
-    _log(progress, f"IOPaint 使用设备：{device}")
-    model_manager = ModelManager(name="lama", device=device)
-    inpaint_request = InpaintRequest()
     first_mask = next(iter(mask_paths.values()))
 
-    for done, (stem, image_path) in enumerate(sorted(image_paths.items()), start=1):
-        mask_path = mask_paths.get(stem, first_mask)
-        with Image.open(image_path) as source_image:
-            infos = source_image.info
-            image = np.array(source_image.convert("RGB"))
-        with Image.open(mask_path) as source_mask:
-            mask = np.array(source_mask.convert("L"))
+    def process_with_device(device) -> None:
+        _log(progress, f"IOPaint 使用设备：{device}")
+        model_manager = ModelManager(name="lama", device=device)
+        inpaint_request = InpaintRequest()
+        for done, (stem, image_path) in enumerate(sorted(image_paths.items()), start=1):
+            mask_path = mask_paths.get(stem, first_mask)
+            with Image.open(image_path) as source_image:
+                infos = source_image.info
+                image = np.array(source_image.convert("RGB"))
+            with Image.open(mask_path) as source_mask:
+                mask = np.array(source_mask.convert("L"))
 
-        if mask.shape[:2] != image.shape[:2]:
-            mask = cv2.resize(
-                mask,
-                (image.shape[1], image.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        mask[mask >= 127] = 255
-        mask[mask < 127] = 0
+            if mask.shape[:2] != image.shape[:2]:
+                mask = cv2.resize(
+                    mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            mask[mask >= 127] = 255
+            mask[mask < 127] = 0
 
-        result = model_manager(image, mask, inpaint_request)
-        result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-        output_path = cleaned_dir / f"{stem}.png"
-        result_image = Image.fromarray(result)
-        output_path.write_bytes(pil_to_bytes(result_image, "png", 100, infos))
-        compressed_path = save_compressed_cleaned_image(result_image, output_path)
-        torch_gc()
-        _log(progress, f"第 {done} 页 IOPaint 擦除后已生成：{compressed_path.name}")
-        _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
+            result = model_manager(image, mask, inpaint_request)
+            result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+            output_path = cleaned_dir / f"{stem}.png"
+            result_image = Image.fromarray(result)
+            output_path.write_bytes(pil_to_bytes(result_image, "png", 100, infos))
+            compressed_path = save_compressed_cleaned_image(result_image, output_path)
+            torch_gc()
+            _log(progress, f"第 {done} 页 IOPaint 擦除后已生成：{compressed_path.name}")
+            _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
+
+    device = preferred_iopaint_device(Device)
+    try:
+        process_with_device(device)
+    except Exception as exc:
+        if device == Device.cpu:
+            raise
+        _log(progress, f"IOPaint CUDA 处理失败，已回退 CPU：{exc}")
+        if cleaned_dir.exists():
+            shutil.rmtree(cleaned_dir)
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        process_with_device(Device.cpu)
 
     missing = [name for name in image_paths if not (cleaned_dir / f"{name}.png").exists()]
     if missing:
@@ -856,18 +869,40 @@ def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: Prog
     _log(progress, "开始用 RealESRGAN 提升导出底图清晰度")
     _progress(progress, 0, f"RealESRGAN 清晰化处理中：0/{len(image_paths)}")
     device = preferred_iopaint_device(Device)
-    _log(progress, f"RealESRGAN 使用设备：{device}")
-    upscaler = RealESRGANUpscaler("realesr-general-x4v3", device, no_half=(device == Device.cpu))
+
+    def create_upscaler(target_device):
+        _log(progress, f"RealESRGAN 使用设备：{target_device}")
+        return RealESRGANUpscaler("realesr-general-x4v3", target_device, no_half=(target_device == Device.cpu))
+
+    try:
+        upscaler = create_upscaler(device)
+    except Exception as exc:
+        if device == Device.cpu:
+            raise
+        _log(progress, f"RealESRGAN CUDA 处理失败，已回退 CPU：{exc}")
+        device = Device.cpu
+        upscaler = create_upscaler(device)
 
     for done, image_path in enumerate(image_paths, start=1):
         with Image.open(image_path) as source_image:
             infos = source_image.info
             rgb_image = np.array(source_image.convert("RGB"))
 
-        bgr_result = upscaler.gen_image(
-            rgb_image,
-            RunPluginRequest(name=RealESRGANUpscaler.name, image="", scale=scale),
-        )
+        try:
+            bgr_result = upscaler.gen_image(
+                rgb_image,
+                RunPluginRequest(name=RealESRGANUpscaler.name, image="", scale=scale),
+            )
+        except Exception as exc:
+            if device == Device.cpu:
+                raise
+            _log(progress, f"RealESRGAN CUDA 处理失败，已回退 CPU：{exc}")
+            device = Device.cpu
+            upscaler = create_upscaler(device)
+            bgr_result = upscaler.gen_image(
+                rgb_image,
+                RunPluginRequest(name=RealESRGANUpscaler.name, image="", scale=scale),
+            )
         rgb_result = cv2.cvtColor(bgr_result, cv2.COLOR_BGR2RGB)
         output_format = "JPEG" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
         result_image = Image.fromarray(rgb_result)

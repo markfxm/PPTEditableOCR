@@ -60,6 +60,12 @@ from .core import (
 )
 from .ocr_config import resolve_ocr_config
 
+FLOW_TEXT = (
+    "1. 打开 PPT/PDF --> 2. 选择 OCR 方式并识别 --> "
+    "3. 检查识别框 --> 4. IOPaint 擦除 --> "
+    "5. 选择是否清晰化 --> 6. 导出可编辑 PPT"
+)
+
 BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, int, int], bool, bool, bool, int]]
 
 
@@ -588,10 +594,7 @@ class MainWindow(QMainWindow):
         root.setStretchFactor(1, 1)
 
     def set_flow_text(self):
-        self.flow_label.setText(
-            "1. 打开 PPT/PDF --> 2. 选择 OCR 方式并识别 --> "
-            "3. 检查识别框 --> 4. 选择是否清晰化 --> 5. 导出可编辑 PPT"
-        )
+        self.flow_label.setText(FLOW_TEXT)
 
     def load_ocr_settings(self):
         backend = self.settings.value("ocr/backend", OCR_BACKEND_LOCAL)

@@ -9,6 +9,7 @@ import json
 import hashlib
 import tempfile
 import traceback
+import importlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -16,9 +17,52 @@ from typing import Callable
 BASE = Path(__file__).resolve().parent.parent
 DEPS_DIR = BASE / ".py310deps"
 IOPAINT_DEPS_DIR = BASE / ".py310iopaint"
+ORIGINAL_SYS_PATH = list(sys.path)
 for deps in [IOPAINT_DEPS_DIR, DEPS_DIR]:
     if deps.exists() and str(deps) not in sys.path:
         sys.path.insert(0, str(deps))
+
+
+def _resolved_sys_path(path: str) -> Path:
+    return Path(path or ".").resolve()
+
+
+def prefer_system_cuda_torch(
+    original_sys_path: list[str] | None = None,
+    bundled_paths: set[Path] | None = None,
+    import_module=importlib.import_module,
+) -> bool:
+    if "torch" in sys.modules:
+        return bool(getattr(getattr(sys.modules["torch"], "cuda", None), "is_available", lambda: False)())
+
+    original_sys_path = list(original_sys_path or ORIGINAL_SYS_PATH)
+    bundled_paths = {path.resolve() for path in (bundled_paths or {IOPAINT_DEPS_DIR, DEPS_DIR})}
+    current_sys_path = list(sys.path)
+    before_modules = set(sys.modules)
+    try:
+        sys.path[:] = [
+            path
+            for path in original_sys_path
+            if _resolved_sys_path(path) not in bundled_paths
+        ]
+        torch_module = import_module("torch")
+        cuda = getattr(torch_module, "cuda", None)
+        is_available = getattr(cuda, "is_available", None)
+        if callable(is_available) and is_available():
+            return True
+    except Exception:
+        pass
+    finally:
+        sys.path[:] = current_sys_path
+
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            if name not in before_modules:
+                sys.modules.pop(name, None)
+    return False
+
+
+prefer_system_cuda_torch()
 
 import cv2
 import numpy as np
@@ -51,6 +95,45 @@ DEFAULT_PPT_WIDTH = Inches(13.333333)
 OCR_BACKEND_LOCAL = "local"
 OCR_BACKEND_REMOTE = "remote"
 REMOTE_OCR_TOKEN_LENGTH = 40
+EXPORT_IMAGE_JPEG_QUALITY = 85
+
+
+def preferred_iopaint_device(device_enum, torch_module=None):
+    if torch_module is None:
+        try:
+            import torch as torch_module
+        except Exception:
+            torch_module = None
+    cuda_available = False
+    if torch_module is not None:
+        cuda = getattr(torch_module, "cuda", None)
+        is_available = getattr(cuda, "is_available", None)
+        if callable(is_available):
+            try:
+                cuda_available = bool(is_available())
+            except Exception:
+                cuda_available = False
+    if cuda_available and hasattr(device_enum, "cuda"):
+        return device_enum.cuda
+    return device_enum.cpu
+
+
+def preferred_paddleocr_device(paddle_module=None) -> str:
+    if paddle_module is None:
+        try:
+            import paddle as paddle_module
+        except Exception:
+            paddle_module = None
+    if paddle_module is not None:
+        device = getattr(paddle_module, "device", None)
+        is_compiled_with_cuda = getattr(device, "is_compiled_with_cuda", None)
+        if callable(is_compiled_with_cuda):
+            try:
+                if is_compiled_with_cuda():
+                    return "gpu"
+            except Exception:
+                pass
+    return "cpu"
 
 
 def bundle_root() -> Path:
@@ -517,8 +600,10 @@ def run_ocr(
             if PaddleOCRClient is None:
                 raise RuntimeError("当前 PaddleOCR 版本不支持远端调用，请升级 paddleocr 后重试。")
             return PaddleOCRClient(token=token)
+        ocr_device = preferred_paddleocr_device()
         return PaddleOCR(
             lang="ch",
+            device=ocr_device,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -526,7 +611,10 @@ def run_ocr(
             text_recognition_model_dir=str(rec_dir) if rec_dir else None,
         )
 
-    _log(progress, "使用远端 PaddleOCR 识别" if use_remote else "使用本地 PaddleOCR 识别")
+    if use_remote:
+        _log(progress, "使用远端 PaddleOCR 识别")
+    else:
+        _log(progress, f"使用本地 PaddleOCR 识别（设备：{preferred_paddleocr_device()}）")
     ocr = create_ocr()
     for slide in slides:
         try:
@@ -676,7 +764,9 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
         _log(progress, "本机未找到 IOPaint lama 模型，开始准备模型")
         cli_download_model("lama")
 
-    model_manager = ModelManager(name="lama", device=Device.cpu)
+    device = preferred_iopaint_device(Device)
+    _log(progress, f"IOPaint 使用设备：{device}")
+    model_manager = ModelManager(name="lama", device=device)
     inpaint_request = InpaintRequest()
     first_mask = next(iter(mask_paths.values()))
 
@@ -700,8 +790,11 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
         result = model_manager(image, mask, inpaint_request)
         result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
         output_path = cleaned_dir / f"{stem}.png"
-        output_path.write_bytes(pil_to_bytes(Image.fromarray(result), "png", 100, infos))
+        result_image = Image.fromarray(result)
+        output_path.write_bytes(pil_to_bytes(result_image, "png", 100, infos))
+        compressed_path = save_compressed_cleaned_image(result_image, output_path)
         torch_gc()
+        _log(progress, f"第 {done} 页 IOPaint 擦除后已生成：{compressed_path.name}")
         _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
 
     missing = [name for name in image_paths if not (cleaned_dir / f"{name}.png").exists()]
@@ -711,16 +804,41 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
     _log(progress, "IOPaint 擦除完成")
 
 
-def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: ProgressCB = None) -> int:
-    if scale <= 1:
-        _log(progress, "RealESRGAN 清晰化已跳过")
-        return 0
+def save_compressed_cleaned_image(image: Image.Image, source_path: Path, quality: int = EXPORT_IMAGE_JPEG_QUALITY) -> Path:
+    output_path = source_path.with_suffix(".jpg")
+    save_kwargs = {
+        "format": "JPEG",
+        "quality": quality,
+        "optimize": True,
+        "progressive": True,
+    }
+    icc_profile = image.info.get("icc_profile")
+    if icc_profile:
+        save_kwargs["icc_profile"] = icc_profile
+    image.convert("RGB").save(output_path, **save_kwargs)
+    return output_path
 
+
+def cleaned_source_image_paths(cleaned_dir: Path) -> list[Path]:
     image_paths = [
         path
         for path in sorted(cleaned_dir.iterdir())
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
     ]
+    png_stems = {path.stem for path in image_paths if path.suffix.lower() == ".png"}
+    return [
+        path
+        for path in image_paths
+        if not (path.suffix.lower() in {".jpg", ".jpeg"} and path.stem in png_stems)
+    ]
+
+
+def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: ProgressCB = None) -> int:
+    if scale <= 1:
+        _log(progress, "RealESRGAN 清晰化已跳过")
+        return 0
+
+    image_paths = cleaned_source_image_paths(cleaned_dir)
     if not image_paths:
         _log(progress, f"没有找到待清晰化图片：{cleaned_dir}")
         return 0
@@ -736,7 +854,9 @@ def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: Prog
 
     _log(progress, "开始用 RealESRGAN 提升导出底图清晰度")
     _progress(progress, 0, f"RealESRGAN 清晰化处理中：0/{len(image_paths)}")
-    upscaler = RealESRGANUpscaler("realesr-general-x4v3", Device.cpu, no_half=True)
+    device = preferred_iopaint_device(Device)
+    _log(progress, f"RealESRGAN 使用设备：{device}")
+    upscaler = RealESRGANUpscaler("realesr-general-x4v3", device, no_half=(device == Device.cpu))
 
     for done, image_path in enumerate(image_paths, start=1):
         with Image.open(image_path) as source_image:
@@ -749,8 +869,14 @@ def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: Prog
         )
         rgb_result = cv2.cvtColor(bgr_result, cv2.COLOR_BGR2RGB)
         output_format = "JPEG" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
-        Image.fromarray(rgb_result).save(image_path, format=output_format, **infos)
+        result_image = Image.fromarray(rgb_result)
+        if output_format == "JPEG":
+            compressed_path = save_compressed_cleaned_image(result_image, image_path)
+        else:
+            result_image.save(image_path, format=output_format, **infos)
+            compressed_path = save_compressed_cleaned_image(result_image, image_path)
         torch_gc()
+        _log(progress, f"第 {done} 页已提升清晰度：{compressed_path.name}")
         _progress(progress, int(done * 100 / len(image_paths)), f"RealESRGAN 清晰化处理中：{done}/{len(image_paths)}")
 
     _log(progress, "RealESRGAN 清晰化完成")
@@ -758,15 +884,24 @@ def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: Prog
 
 
 def cleaned_image_path(cleaned_dir: Path, name: str):
+    def preferred_existing(path: Path) -> Path | None:
+        for candidate in [path.with_suffix(".jpg"), path.with_suffix(".jpeg"), path]:
+            if candidate.exists():
+                return candidate
+        return None
+
     nested = cleaned_dir / name / name.replace("_clean", "")
-    if nested.exists():
-        return nested
+    preferred = preferred_existing(nested)
+    if preferred:
+        return preferred
     direct = cleaned_dir / name
-    if direct.exists():
-        return direct
+    preferred = preferred_existing(direct)
+    if preferred:
+        return preferred
     fallback = cleaned_dir / name.replace("_clean", "")
-    if fallback.exists():
-        return fallback
+    preferred = preferred_existing(fallback)
+    if preferred:
+        return preferred
     raise FileNotFoundError(name)
 
 

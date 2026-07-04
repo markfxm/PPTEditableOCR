@@ -717,8 +717,20 @@ def run_ocr_page_subprocess(
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONFAULTHANDLER", "1")
         try:
+            if getattr(sys, "frozen", False):
+                command = [sys.executable, "--ocr-page-worker", str(input_path), str(output_path)]
+            else:
+                command = [
+                    sys.executable,
+                    "-X",
+                    "faulthandler",
+                    "-m",
+                    "app.ocr_page_worker",
+                    str(input_path),
+                    str(output_path),
+                ]
             result = runner(
-                [sys.executable, "-X", "faulthandler", "-m", "app.ocr_page_worker", str(input_path), str(output_path)],
+                command,
                 cwd=str(BASE),
                 env=env,
                 text=True,

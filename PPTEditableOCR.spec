@@ -117,6 +117,7 @@ for package in packages:
     binaries += filter_entries(pkg_binaries)
 
 hiddenimports += [
+    "app.ocr_page_worker",
     "fileinput",
     "PySide6.QtCore",
     "PySide6.QtGui",

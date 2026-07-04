@@ -63,24 +63,9 @@ def prefer_system_cuda_torch(
     return False
 
 
-prefer_system_cuda_torch()
-
 import cv2
 import numpy as np
 from PIL import Image
-from paddleocr import PaddleOCR
-try:
-    from paddleocr import PaddleOCRClient
-except ImportError:
-    PaddleOCRClient = None
-try:
-    from paddleocr import Model
-except ImportError:
-    Model = None
-try:
-    from paddleocr import OCROptions
-except ImportError:
-    OCROptions = None
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
@@ -97,6 +82,29 @@ OCR_BACKEND_LOCAL = "local"
 OCR_BACKEND_REMOTE = "remote"
 REMOTE_OCR_TOKEN_LENGTH = 40
 EXPORT_IMAGE_JPEG_QUALITY = 85
+_PADDLEOCR_SYMBOLS = None
+
+
+def load_paddleocr_symbols():
+    global _PADDLEOCR_SYMBOLS
+    if _PADDLEOCR_SYMBOLS is not None:
+        return _PADDLEOCR_SYMBOLS
+    from paddleocr import PaddleOCR
+
+    try:
+        from paddleocr import PaddleOCRClient
+    except ImportError:
+        PaddleOCRClient = None
+    try:
+        from paddleocr import Model
+    except ImportError:
+        Model = None
+    try:
+        from paddleocr import OCROptions
+    except ImportError:
+        OCROptions = None
+    _PADDLEOCR_SYMBOLS = PaddleOCR, PaddleOCRClient, Model, OCROptions
+    return _PADDLEOCR_SYMBOLS
 
 
 def preferred_iopaint_device(device_enum, torch_module=None):
@@ -578,7 +586,7 @@ def extract_slide_images(source_pptx: Path, images_dir: Path, progress: Progress
     return src, extracted
 
 
-def _make_remote_ocr_options():
+def _make_remote_ocr_options(OCROptions):
     if OCROptions is None:
         return None
     try:
@@ -628,13 +636,13 @@ def _result_as_page_dict(page) -> dict:
     }
 
 
-def _predict_remote_ocr_page(client, image_path: Path) -> dict:
+def _predict_remote_ocr_page(client, image_path: Path, Model=None, OCROptions=None) -> dict:
     model = getattr(Model, "PP_OCRV5", "PP-OCRv5") if Model is not None else "PP-OCRv5"
     kwargs = {
         "file_path": str(image_path),
         "model": model,
     }
-    options = _make_remote_ocr_options()
+    options = _make_remote_ocr_options(OCROptions)
     if options is not None:
         kwargs["options"] = options
     try:
@@ -653,6 +661,7 @@ def predict_ocr_page(
     ocr_backend: str = OCR_BACKEND_LOCAL,
     ocr_token: str | None = None,
 ) -> list[OCRBox]:
+    PaddleOCR, PaddleOCRClient, Model, OCROptions = load_paddleocr_symbols()
     det_dir = bundled_ocr_model_dir("PP-OCRv5_server_det")
     rec_dir = bundled_ocr_model_dir("PP-OCRv5_server_rec")
     use_remote = ocr_backend == OCR_BACKEND_REMOTE
@@ -664,7 +673,7 @@ def predict_ocr_page(
             raise RuntimeError("当前 PaddleOCR 版本不支持远端调用，请升级 paddleocr 后重试。")
         client = PaddleOCRClient(token=token)
         try:
-            page = _predict_remote_ocr_page(client, slide.image_path)
+            page = _predict_remote_ocr_page(client, slide.image_path, Model, OCROptions)
         finally:
             if hasattr(client, "close"):
                 client.close()
@@ -765,6 +774,7 @@ def run_ocr(
     ocr_backend: str = OCR_BACKEND_LOCAL,
     ocr_token: str | None = None,
 ):
+    PaddleOCR, PaddleOCRClient, Model, OCROptions = load_paddleocr_symbols()
     det_dir = bundled_ocr_model_dir("PP-OCRv5_server_det")
     rec_dir = bundled_ocr_model_dir("PP-OCRv5_server_rec")
     use_remote = ocr_backend == OCR_BACKEND_REMOTE
@@ -796,7 +806,7 @@ def run_ocr(
     for slide in slides:
         try:
             if use_remote:
-                page = _predict_remote_ocr_page(ocr, slide.image_path)
+                page = _predict_remote_ocr_page(ocr, slide.image_path, Model, OCROptions)
             else:
                 page = ocr.predict(str(slide.image_path))[0]
         except Exception as exc:

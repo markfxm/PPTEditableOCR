@@ -45,12 +45,14 @@ from PySide6.QtWidgets import (
 
 from .core import (
     OCRBox,
+    OCRPageProcessError,
     PPTProject,
     PPTSlide,
+    cache_path_candidates,
     convert_pdf_to_pptx,
     export_editable_ppt,
     prepare_project,
-    run_ocr,
+    run_ocr_page_subprocess,
     save_project_cache,
     OCR_BACKEND_LOCAL,
     OCR_BACKEND_REMOTE,
@@ -72,12 +74,16 @@ BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, 
 def page_list_text(index: int, box_count: int, status: str = "ok") -> str:
     if status == "failed":
         return f"第{index}页 - OCR失败"
+    if status == "skipped":
+        return f"第{index}页 - 已跳过"
+    if status == "pending":
+        return f"第{index}页 - 待OCR"
     return f"第{index}页 - {box_count} 个框"
 
 
 class Worker(QObject):
     finished = Signal(object)
-    failed = Signal(str)
+    failed = Signal(str, object)
     progress = Signal(str)
 
     def __init__(self, fn, *args, **kwargs):
@@ -89,10 +95,27 @@ class Worker(QObject):
     def run(self):
         try:
             result = self.fn(*self.args, progress=self.progress.emit, **self.kwargs)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as exc:
+            self.failed.emit(traceback.format_exc(), exc)
         else:
             self.finished.emit(result)
+
+
+class PptListItemWidget(QWidget):
+    def __init__(self, path: Path, remove_cb, parent=None):
+        super().__init__(parent)
+        self.path = path
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 2, 0)
+        layout.setSpacing(4)
+        remove_btn = QPushButton("×")
+        remove_btn.setToolTip("从列表中删除")
+        remove_btn.setFixedSize(22, 22)
+        remove_btn.clicked.connect(remove_cb)
+        layout.addWidget(remove_btn)
+        label = QLabel(path.name)
+        label.setToolTip(str(path))
+        layout.addWidget(label, 1)
 
 
 class EditableRectItem(QGraphicsRectItem):
@@ -427,6 +450,10 @@ class MainWindow(QMainWindow):
         self.selecting_ppt_list_item = False
         self.pending_autoload_ppt: Path | None = None
         self.current_export_output: Path | None = None
+        self.ocr_next_index = 0
+        self.ocr_backend: str = OCR_BACKEND_LOCAL
+        self.ocr_token: str | None = None
+        self.pending_ocr_error: tuple[str, object | None] | None = None
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
 
         self._build_ui()
@@ -521,7 +548,7 @@ class MainWindow(QMainWindow):
         ocr_layout.addRow(self.start_ocr_btn)
         self.ocr_token_status = QLabel("远端令牌未设置")
         self.ocr_token_status.setWordWrap(True)
-        ocr_layout.addRow("远端令牌", self.ocr_token_status)
+        ocr_layout.addRow(self.ocr_token_status)
         side_layout.addWidget(ocr_group)
 
         form = QFormLayout()
@@ -578,8 +605,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         side_layout.addWidget(self.progress_bar)
 
-        self.enhance_images_cb = QCheckBox("导出时清晰化底图（RealESRGAN）")
-        self.enhance_images_cb.setChecked(True)
+        self.enhance_images_cb = QCheckBox("导出时清晰化底图（RealESRGAN）（可选）")
+        self.enhance_images_cb.setChecked(False)
         side_layout.addWidget(self.enhance_images_cb)
 
         self.continue_export_btn = QPushButton("继续：导出可编辑 PPT")
@@ -710,7 +737,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
         self.update_undo_action()
 
-    def run_worker(self, fn, finished_cb, *args, **kwargs):
+    def run_worker(self, fn, finished_cb, *args, failed_cb=None, **kwargs):
         if self.worker_thread:
             return
         self.worker_thread = QThread(self)
@@ -718,9 +745,12 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.worker_thread)
         self.worker.progress.connect(self.append_log)
         self.worker.finished.connect(finished_cb)
-        self.worker.failed.connect(self.on_worker_failed)
+        if failed_cb is None:
+            self.worker.failed.connect(lambda msg, _exc: self.on_worker_failed(msg))
+        else:
+            self.worker.failed.connect(failed_cb)
         self.worker.finished.connect(self.cleanup_worker)
-        self.worker.failed.connect(lambda _msg: self.cleanup_worker())
+        self.worker.failed.connect(lambda _msg, _exc: self.cleanup_worker())
         self.worker_thread.started.connect(self.worker.run)
         self.set_busy(True)
         self.worker_thread.start()
@@ -789,14 +819,60 @@ class MainWindow(QMainWindow):
         except ValueError:
             row = len(self.ppt_paths)
             self.ppt_paths.append(source)
-            item = QListWidgetItem(source.name)
+            item = QListWidgetItem()
             item.setToolTip(str(source))
             self.ppt_file_list.addItem(item)
+            widget = PptListItemWidget(
+                source,
+                lambda _checked=False, path=source: self.remove_ppt_from_recent_list_by_path(path),
+                self.ppt_file_list,
+            )
+            item.setSizeHint(widget.sizeHint())
+            self.ppt_file_list.setItemWidget(item, widget)
         if select:
             self.selecting_ppt_list_item = True
             self.ppt_file_list.setCurrentRow(row)
             self.selecting_ppt_list_item = False
         return row
+
+    def remove_ppt_from_recent_list_by_path(self, path: Path):
+        source = path.expanduser().resolve()
+        try:
+            row = self.ppt_paths.index(source)
+        except ValueError:
+            return
+        self.remove_ppt_from_recent_list(row)
+
+    def remove_ppt_from_recent_list(self, row: int):
+        if self.worker_thread or row < 0 or row >= len(self.ppt_paths):
+            return
+        source = self.ppt_paths.pop(row)
+        self.selecting_ppt_list_item = True
+        self.ppt_file_list.takeItem(row)
+        self.selecting_ppt_list_item = False
+        if self.project and self.project.source_pptx == source:
+            self.clear_current_project("已从 PPT 列表删除当前文件")
+        elif self.ppt_file_list.count():
+            next_row = min(row, self.ppt_file_list.count() - 1)
+            self.ppt_file_list.setCurrentRow(next_row)
+
+    def clear_current_project(self, progress_text: str | None = None):
+        self.project = None
+        self.current_slide = None
+        self.selected_item = None
+        self.current_items.clear()
+        self.undo_stacks.clear()
+        self.pending_select_index = None
+        self.slide_list.clear()
+        self.scene.clear()
+        self.save_cache_action.setEnabled(False)
+        self.start_ocr_btn.setEnabled(False)
+        self.continue_export_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if progress_text:
+            self.progress_label.setText(progress_text)
+        self.update_undo_action()
 
     def load_ppt_path(
         self,
@@ -809,15 +885,7 @@ class MainWindow(QMainWindow):
             return
         if add_to_list:
             self.add_ppt_to_recent_list(source, select=select_in_list)
-        self.project = None
-        self.current_slide = None
-        self.selected_item = None
-        self.current_items.clear()
-        self.undo_stacks.clear()
-        self.pending_select_index = None
-        self.slide_list.clear()
-        self.scene.clear()
-        self.save_cache_action.setEnabled(False)
+        self.clear_current_project()
         self.append_log(f"开始加载：{source}")
         self.run_worker(
             prepare_project,
@@ -829,6 +897,8 @@ class MainWindow(QMainWindow):
     def start_ocr(self):
         if not self.project:
             QMessageBox.information(self, "提示", "请先打开一个 PPT。")
+            return
+        if self.has_existing_ocr_result() and not self.confirm_restart_ocr():
             return
         ocr_backend, ocr_token, fallback_message = self.resolved_ocr_config()
         if fallback_message:
@@ -848,33 +918,146 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.append_log("开始 OCR 识别")
-        self.run_worker(
-            run_ocr,
-            self.on_ocr_finished,
-            self.project.slides,
-            ocr_backend=ocr_backend,
-            ocr_token=ocr_token,
-        )
+        self.ocr_backend = ocr_backend
+        self.ocr_token = ocr_token
+        self.ocr_next_index = 0
+        self.pending_ocr_error = None
+        for slide in self.project.slides:
+            slide.boxes = []
+            slide.ocr_status = "pending"
+        self.refresh_slide_list()
+        if self.project.slides:
+            self.slide_list.setCurrentRow(0)
+        self.run_next_ocr_page()
 
-    def on_ocr_finished(self, _result):
+    def has_existing_ocr_result(self) -> bool:
+        if not self.project:
+            return False
+        return any(slide.boxes or slide.ocr_status in {"ok", "failed", "skipped"} for slide in self.project.slides)
+
+    def current_cache_display_path(self) -> Path | None:
+        if not self.project:
+            return None
+        candidates = cache_path_candidates(self.project.source_pptx)
+        return next((path for path in candidates if path.exists()), candidates[0] if candidates else None)
+
+    def confirm_restart_ocr(self) -> bool:
+        cache_path = self.current_cache_display_path()
+        location = str(cache_path) if cache_path else "当前项目缓存"
+        answer = QMessageBox.question(
+            self,
+            "重新 OCR？",
+            (
+                "已经识别完成，识别结果文件在：\n"
+                f"{location}\n\n"
+                "你想重新识别吗？\n"
+                "再次识别会替换现有 JSON 源文件。"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def refresh_slide_list(self):
         if not self.project:
             return
-        current_index = self.current_slide.index if self.current_slide else 1
         self.slide_list.clear()
         for slide in self.project.slides:
-            item = QListWidgetItem(page_list_text(slide.index, len(slide.boxes)))
+            item = QListWidgetItem(page_list_text(slide.index, len(slide.boxes), slide.ocr_status))
             self.slide_list.addItem(item)
-        if self.project.slides:
-            row = max(0, min(current_index - 1, len(self.project.slides) - 1))
-            self.slide_list.setCurrentRow(row)
-            self.current_slide = self.project.slides[row]
+
+    def run_next_ocr_page(self):
+        if not self.project:
+            return
+        if self.ocr_next_index >= len(self.project.slides):
+            self.finish_ocr_flow()
+            return
+        slide = self.project.slides[self.ocr_next_index]
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(int(self.ocr_next_index * 100 / max(1, len(self.project.slides))))
+        self.progress_label.setText(f"正在 OCR：第 {slide.index} 页")
+        self.run_worker(
+            run_ocr_page_subprocess,
+            self.on_ocr_page_finished,
+            slide,
+            failed_cb=self.on_ocr_page_failed,
+            ocr_backend=self.ocr_backend,
+            ocr_token=self.ocr_token,
+        )
+
+    def on_ocr_page_finished(self, boxes: list[OCRBox]):
+        if not self.project:
+            return
+        slide = self.project.slides[self.ocr_next_index]
+        slide.boxes = boxes
+        slide.ocr_status = "ok"
+        self.update_slide_list_item(slide)
+        if self.current_slide is slide:
             self.render_current_slide()
+        self.append_log(f"第 {slide.index} 页 OCR 完成，共 {len(boxes)} 个框")
+        self.save_current_cache(show_message=False, log_success=False)
+        self.ocr_next_index += 1
+        QTimer.singleShot(0, self.run_next_ocr_page)
+
+    def on_ocr_page_failed(self, error_text: str, exc: object):
+        self.pending_ocr_error = (error_text, exc)
+        QTimer.singleShot(0, self.prompt_ocr_page_failure)
+
+    def prompt_ocr_page_failure(self):
+        if not self.project or not self.pending_ocr_error:
+            return
+        error_text, exc = self.pending_ocr_error
+        self.pending_ocr_error = None
+        slide = self.project.slides[self.ocr_next_index]
+        slide.boxes = []
+        slide.ocr_status = "failed"
+        self.update_slide_list_item(slide)
+        self.slide_list.setCurrentRow(self.ocr_next_index)
+        self.current_slide = slide
+        self.render_current_slide()
+        output = getattr(exc, "output", "") if isinstance(exc, OCRPageProcessError) else ""
+        self.append_log(f"第 {slide.index} 页 OCR 子进程异常，已暂停。")
+        if output:
+            self.append_log(output)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("OCR 失败")
+        dialog.setText(f"第 {slide.index} 页 OCR 子进程异常退出。")
+        dialog.setInformativeText("可以重试此页、跳过此页继续后续页面，或取消本次 OCR。")
+        if output or error_text:
+            dialog.setDetailedText(output or error_text)
+        retry_btn = dialog.addButton("重试此页", QMessageBox.ButtonRole.AcceptRole)
+        skip_btn = dialog.addButton("跳过此页", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = dialog.addButton("取消 OCR", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is retry_btn:
+            slide.ocr_status = "pending"
+            self.update_slide_list_item(slide)
+            self.run_next_ocr_page()
+        elif clicked is skip_btn:
+            slide.ocr_status = "skipped"
+            slide.boxes = []
+            self.update_slide_list_item(slide)
+            self.save_current_cache(show_message=False, log_success=False)
+            self.ocr_next_index += 1
+            QTimer.singleShot(0, self.run_next_ocr_page)
+        elif clicked is cancel_btn:
+            self.finish_ocr_flow(cancelled=True)
+
+    def finish_ocr_flow(self, cancelled: bool = False):
+        if not self.project:
+            return
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.progress_label.setText("OCR 完成，请检查识别框，然后点击“继续：导出可编辑 PPT”。")
-        self.append_log("OCR 完成")
+        if cancelled:
+            self.progress_label.setText("OCR 已取消，已保留当前已完成页面。")
+            self.append_log("OCR 已取消")
+        else:
+            self.progress_label.setText("OCR 完成，请检查识别框，然后点击“继续：导出可编辑 PPT”。")
+            self.append_log("OCR 完成")
         self.start_ocr_btn.setEnabled(True)
-        self.save_current_cache(show_message=False)
+        self.save_current_cache(show_message=False, success_prefix="识别结果已保存")
         self.update_undo_action()
 
     def on_ppt_file_selected(self, row: int):
@@ -892,7 +1075,9 @@ class MainWindow(QMainWindow):
         self.undo_stacks.clear()
         self.slide_list.clear()
         for slide in project.slides:
-            item = QListWidgetItem(page_list_text(slide.index, len(slide.boxes)))
+            if slide.boxes and slide.ocr_status == "pending":
+                slide.ocr_status = "ok"
+            item = QListWidgetItem(page_list_text(slide.index, len(slide.boxes), slide.ocr_status))
             self.slide_list.addItem(item)
         if project.slides:
             self.slide_list.setCurrentRow(0)
@@ -908,7 +1093,12 @@ class MainWindow(QMainWindow):
         self.continue_export_btn.setEnabled(True)
         self.update_undo_action()
 
-    def save_current_cache(self, show_message: bool = True):
+    def save_current_cache(
+        self,
+        show_message: bool = True,
+        log_success: bool = True,
+        success_prefix: str = "识别框已保存",
+    ):
         if not self.project:
             if show_message:
                 QMessageBox.information(self, "提示", "请先打开一个 PPT。")
@@ -920,7 +1110,8 @@ class MainWindow(QMainWindow):
             if show_message:
                 QMessageBox.critical(self, "保存失败", f"识别框保存失败：{exc}")
             return
-        self.append_log(f"识别框已保存：{cache_path}")
+        if log_success:
+            self.append_log(f"{success_prefix}：{cache_path}")
         if show_message:
             QMessageBox.information(self, "完成", f"识别框已保存：\n{cache_path}")
 
@@ -1017,7 +1208,7 @@ class MainWindow(QMainWindow):
             return
         item = self.slide_list.item(row)
         if item:
-            item.setText(page_list_text(slide.index, len(slide.boxes)))
+            item.setText(page_list_text(slide.index, len(slide.boxes), slide.ocr_status))
 
     def undo(self):
         if not self.current_slide:
@@ -1163,7 +1354,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_label.setText("准备导出")
-        self.save_current_cache(show_message=False)
+        self.save_current_cache(show_message=False, log_success=False)
         self.append_log("开始导出可编辑 PPT")
         self.run_worker(
             export_editable_ppt,

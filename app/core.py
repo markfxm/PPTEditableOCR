@@ -209,10 +209,25 @@ class PPTSlide:
     boxes: list[OCRBox] = field(default_factory=list)
     watermark_rect: tuple[int, int, int, int] | None = None
     remove_watermark: bool = True
+    ocr_status: str = "pending"
 
     def reset_boxes(self, pad_x: int, pad_y: int):
         for box in self.boxes:
             box.reset_from_bbox(pad_x, pad_y, self.image_width, self.image_height)
+
+
+class OCRPageProcessError(RuntimeError):
+    def __init__(
+        self,
+        slide_index: int,
+        message: str,
+        returncode: int | None = None,
+        output: str = "",
+    ):
+        super().__init__(message)
+        self.slide_index = slide_index
+        self.returncode = returncode
+        self.output = output
 
 
 @dataclass
@@ -270,6 +285,7 @@ def save_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                 "image_height": int(slide.image_height),
                 "watermark_rect": _rect_to_list(slide.watermark_rect) if slide.watermark_rect else None,
                 "remove_watermark": bool(slide.remove_watermark),
+                "ocr_status": slide.ocr_status,
                 "boxes": [
                     {
                         "text": box.text,
@@ -329,6 +345,7 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
 
     for slide, cached in zip(project.slides, cached_slides):
         slide.remove_watermark = bool(cached.get("remove_watermark", slide.remove_watermark))
+        slide.ocr_status = str(cached.get("ocr_status") or ("ok" if cached.get("boxes") else "pending"))
         slide.watermark_rect = _rect_from_data(cached.get("watermark_rect"), slide.watermark_rect) if cached.get("watermark_rect") else slide.watermark_rect
         slide.boxes = []
         for item in cached.get("boxes", []):
@@ -385,6 +402,54 @@ def _progress(progress: ProgressCB, percent: int, message: str):
 
 def _page_ready(progress: ProgressCB, slide: PPTSlide, status: str = "ok"):
     _log(progress, f"{PAGE_READY_PREFIX}{slide.index}|{len(slide.boxes)}|{status}")
+
+
+def ocr_box_to_data(box: OCRBox) -> dict:
+    return {
+        "text": box.text,
+        "score": float(box.score),
+        "bbox": _rect_to_list(box.bbox),
+        "erase_rect": _rect_to_list(box.erase_rect),
+        "enabled": bool(box.enabled),
+        "manual": bool(box.manual),
+        "edited": bool(box.edited),
+        "rotation": int(box.rotation),
+    }
+
+
+def ocr_box_from_data(data: dict) -> OCRBox:
+    bbox = _rect_from_data(data.get("bbox"), (0, 0, 1, 1))
+    erase_rect = _rect_from_data(data.get("erase_rect"), bbox)
+    return OCRBox(
+        text=str(data.get("text") or ""),
+        score=float(data.get("score", 1.0)),
+        bbox=bbox,
+        erase_rect=erase_rect,
+        enabled=bool(data.get("enabled", True)),
+        manual=bool(data.get("manual", False)),
+        edited=bool(data.get("edited", False)),
+        rotation=int(data.get("rotation", 0)),
+    )
+
+
+def build_ocr_boxes(page: dict, slide: PPTSlide) -> list[OCRBox]:
+    boxes: list[OCRBox] = []
+    for poly, text, score in zip(page["dt_polys"], page["rec_texts"], page["rec_scores"]):
+        text = (text or "").strip()
+        if not text:
+            continue
+        x, y, w, h = box_to_rect(poly)
+        erase_rect = default_expand_rect(x, y, w, h, slide.image_width, slide.image_height)
+        boxes.append(
+            OCRBox(
+                text=text,
+                score=float(score),
+                bbox=(x, y, w, h),
+                erase_rect=erase_rect,
+                enabled=text not in SKIP_TEXTS,
+            )
+        )
+    return boxes
 
 
 def unique_output_path(path: Path) -> Path:
@@ -583,6 +648,105 @@ def _predict_remote_ocr_page(client, image_path: Path) -> dict:
     return _result_as_page_dict(pages[0])
 
 
+def predict_ocr_page(
+    slide: PPTSlide,
+    ocr_backend: str = OCR_BACKEND_LOCAL,
+    ocr_token: str | None = None,
+) -> list[OCRBox]:
+    det_dir = bundled_ocr_model_dir("PP-OCRv5_server_det")
+    rec_dir = bundled_ocr_model_dir("PP-OCRv5_server_rec")
+    use_remote = ocr_backend == OCR_BACKEND_REMOTE
+    if use_remote:
+        token = (ocr_token or os.environ.get("PADDLEOCR_ACCESS_TOKEN") or "").strip()
+        if len(token) != REMOTE_OCR_TOKEN_LENGTH:
+            raise RuntimeError("远端 OCR 需要 40 位访问令牌。")
+        if PaddleOCRClient is None:
+            raise RuntimeError("当前 PaddleOCR 版本不支持远端调用，请升级 paddleocr 后重试。")
+        client = PaddleOCRClient(token=token)
+        try:
+            page = _predict_remote_ocr_page(client, slide.image_path)
+        finally:
+            if hasattr(client, "close"):
+                client.close()
+        return build_ocr_boxes(page, slide)
+
+    ocr = PaddleOCR(
+        lang="ch",
+        device=preferred_paddleocr_device(),
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_detection_model_dir=str(det_dir) if det_dir else None,
+        text_recognition_model_dir=str(rec_dir) if rec_dir else None,
+    )
+    page = ocr.predict(str(slide.image_path))[0]
+    return build_ocr_boxes(page, slide)
+
+
+def run_ocr_page_subprocess(
+    slide: PPTSlide,
+    progress: ProgressCB = None,
+    ocr_backend: str = OCR_BACKEND_LOCAL,
+    ocr_token: str | None = None,
+    runner=subprocess.run,
+    timeout: int | None = None,
+) -> list[OCRBox]:
+    _log(progress, f"开始第 {slide.index} 页 OCR")
+    with tempfile.TemporaryDirectory(prefix="ppttoedit_ocr_page_") as temp_dir:
+        temp_root = Path(temp_dir)
+        input_path = temp_root / "input.json"
+        output_path = temp_root / "output.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "slide": {
+                        "index": slide.index,
+                        "image_name": slide.image_name,
+                        "image_path": str(slide.image_path),
+                        "image_width": slide.image_width,
+                        "image_height": slide.image_height,
+                    },
+                    "ocr_backend": ocr_backend,
+                    "ocr_token": ocr_token,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONFAULTHANDLER", "1")
+        try:
+            result = runner(
+                [sys.executable, "-X", "faulthandler", "-m", "app.ocr_page_worker", str(input_path), str(output_path)],
+                cwd=str(BASE),
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = "\n".join(part for part in [exc.stdout or "", exc.stderr or ""] if part)
+            raise OCRPageProcessError(slide.index, f"第 {slide.index} 页 OCR 超时。", None, output) from exc
+
+        output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+        if result.returncode != 0:
+            raise OCRPageProcessError(
+                slide.index,
+                f"第 {slide.index} 页 OCR 子进程异常退出（代码 {result.returncode}）。",
+                result.returncode,
+                output,
+            )
+        try:
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OCRPageProcessError(slide.index, f"第 {slide.index} 页 OCR 结果读取失败。", result.returncode, output) from exc
+    return [ocr_box_from_data(item) for item in payload.get("boxes", [])]
+
+
 def run_ocr(
     slides: list[PPTSlide],
     progress: ProgressCB = None,
@@ -627,6 +791,7 @@ def run_ocr(
             _log(progress, f"第 {slide.index} 页 OCR 失败，已跳过该页，可稍后手动新增框：{exc}")
             _log(progress, traceback.format_exc())
             slide.boxes = []
+            slide.ocr_status = "failed"
             _page_ready(progress, slide, status="failed")
             try:
                 if use_remote and hasattr(ocr, "close"):
@@ -635,23 +800,9 @@ def run_ocr(
             except Exception as reset_exc:
                 _log(progress, f"OCR 引擎重置失败，后续页面可能继续失败：{reset_exc}")
             continue
-        boxes: list[OCRBox] = []
-        for poly, text, score in zip(page["dt_polys"], page["rec_texts"], page["rec_scores"]):
-            text = (text or "").strip()
-            if not text:
-                continue
-            x, y, w, h = box_to_rect(poly)
-            erase_rect = default_expand_rect(x, y, w, h, slide.image_width, slide.image_height)
-            boxes.append(
-                OCRBox(
-                    text=text,
-                    score=float(score),
-                    bbox=(x, y, w, h),
-                    erase_rect=erase_rect,
-                    enabled=text not in SKIP_TEXTS,
-                )
-            )
+        boxes = build_ocr_boxes(page, slide)
         slide.boxes = boxes
+        slide.ocr_status = "ok"
         _page_ready(progress, slide)
         _log(progress, f"第 {slide.index} 页 OCR 完成，共 {len(boxes)} 个框")
     if use_remote and hasattr(ocr, "close"):

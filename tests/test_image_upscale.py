@@ -1,6 +1,9 @@
+import json
+import subprocess
 import sys
 import types
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,10 +18,18 @@ from app.core import (
     cleaned_image_path,
     export_editable_ppt,
     prefer_system_cuda_torch,
+    prepare_iopaint_torch,
     preferred_iopaint_device,
     preferred_paddleocr_device,
+    ppt_project_from_data,
+    ppt_project_to_data,
     rebuild_ppt,
+    run_export_editable_ppt_subprocess,
     run_iopaint,
+    sample_text_color,
+    default_watermark_rect,
+    build_masks,
+    load_project_cache,
     save_compressed_cleaned_image,
     upscale_cleaned_images,
 )
@@ -99,6 +110,14 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             self.assertFalse(selected)
             self.assertNotIn("torch", sys.modules)
             self.assertNotIn("torch.cuda", sys.modules)
+
+    def test_prepare_iopaint_torch_logs_when_system_cuda_torch_selected(self):
+        messages = []
+        with unittest.mock.patch("app.core.prefer_system_cuda_torch", return_value=True):
+            selected = prepare_iopaint_torch(progress=messages.append)
+
+        self.assertTrue(selected)
+        self.assertIn("已优先使用系统 CUDA Torch", messages)
 
     def test_prefers_cuda_for_iopaint_when_torch_cuda_is_available(self):
         device = types.SimpleNamespace(cpu="cpu", cuda="cuda")
@@ -258,6 +277,93 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
 
             self.assertTrue(output_path.exists())
             convert.assert_not_called()
+
+    def test_default_watermark_rect_covers_notebooklm_icon_area(self):
+        rect = default_watermark_rect(1000, 600)
+
+        self.assertLessEqual(rect[0], 740)
+        self.assertLessEqual(rect[1], 480)
+        self.assertEqual(rect[2:], (999, 599))
+
+    def test_build_masks_erases_expanded_watermark_area(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images_dir = root / "images"
+            masks_dir = root / "masks"
+            cleaned_dir = root / "cleaned"
+            images_dir.mkdir()
+            image_path = images_dir / "slide_01.png"
+            Image.new("RGB", (1000, 600), (255, 255, 255)).save(image_path)
+            slide = PPTSlide(
+                index=1,
+                image_name="slide_01.png",
+                image_path=image_path,
+                image_width=1000,
+                image_height=600,
+                watermark_rect=default_watermark_rect(1000, 600),
+            )
+            project = PPTProject(
+                source_pptx=root / "source.pptx",
+                work_dir=root,
+                images_dir=images_dir,
+                masks_dir=masks_dir,
+                cleaned_dir=cleaned_dir,
+                slides=[slide],
+                slide_width=914400,
+                slide_height=914400,
+            )
+
+            build_masks(project)
+
+            with Image.open(masks_dir / "slide_01.png") as mask:
+                self.assertEqual(mask.getpixel((745, 500)), 255)
+                self.assertEqual(mask.getpixel((700, 500)), 0)
+
+    def test_load_project_cache_expands_old_watermark_rect(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "slide_01.png"
+            Image.new("RGB", (1000, 600), (255, 255, 255)).save(image_path)
+            slide = PPTSlide(
+                index=1,
+                image_name="slide_01.png",
+                image_path=image_path,
+                image_width=1000,
+                image_height=600,
+                watermark_rect=(810, 510, 999, 599),
+            )
+            project = PPTProject(
+                source_pptx=root / "source.pptx",
+                work_dir=root,
+                images_dir=root,
+                masks_dir=root / "masks",
+                cleaned_dir=root / "cleaned",
+                slides=[slide],
+                slide_width=914400,
+                slide_height=914400,
+            )
+            cache_path = root / "cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "slides": [
+                            {
+                                "index": 1,
+                                "image_width": 1000,
+                                "image_height": 600,
+                                "watermark_rect": [810, 510, 999, 599],
+                                "remove_watermark": True,
+                                "boxes": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(load_project_cache(project, cache_path=cache_path))
+
+            self.assertEqual(project.slides[0].watermark_rect, default_watermark_rect(1000, 600))
 
     def test_iopaint_logs_each_generated_cleaned_page(self):
         with TemporaryDirectory() as temp_dir:
@@ -443,6 +549,149 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             text_shape = next(shape for shape in deck.slides[0].shapes if getattr(shape, "text", "") == "Hello")
             self.assertEqual(text_shape.left, 457200)
 
+    def test_rebuild_preserves_light_text_color_on_dark_background(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images_dir = root / "images"
+            cleaned_dir = root / "cleaned"
+            masks_dir = root / "masks"
+            images_dir.mkdir()
+            cleaned_dir.mkdir()
+            masks_dir.mkdir()
+
+            original_path = images_dir / "slide_01.png"
+            cleaned_path = cleaned_dir / "slide_01.png"
+            original = Image.new("RGB", (100, 40), (8, 18, 30))
+            pixels = original.load()
+            for x in range(20, 80):
+                for y in range(10, 24):
+                    pixels[x, y] = (235, 240, 245)
+            original.save(original_path)
+            Image.new("RGB", (100, 40), (8, 18, 30)).save(cleaned_path)
+
+            project = PPTProject(
+                source_pptx=root / "source.pptx",
+                work_dir=root,
+                images_dir=images_dir,
+                masks_dir=masks_dir,
+                cleaned_dir=cleaned_dir,
+                slides=[
+                    PPTSlide(
+                        index=1,
+                        image_name="slide_01.png",
+                        image_path=original_path,
+                        image_width=100,
+                        image_height=40,
+                        boxes=[
+                            OCRBox(
+                                text="Hello",
+                                score=1.0,
+                                bbox=(20, 10, 60, 14),
+                                erase_rect=(16, 6, 84, 28),
+                            )
+                        ],
+                    )
+                ],
+                slide_width=914400,
+                slide_height=914400,
+            )
+
+            output_path = root / "out.pptx"
+            rebuild_ppt(project, output_path)
+
+            from pptx import Presentation
+
+            deck = Presentation(str(output_path))
+            text_shape = next(shape for shape in deck.slides[0].shapes if getattr(shape, "text", "") == "Hello")
+            color = text_shape.text_frame.paragraphs[0].runs[0].font.color.rgb
+            self.assertGreater(sum(tuple(color)), 600)
+
+    def test_rebuild_preserves_mixed_text_colors_with_same_font_size(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images_dir = root / "images"
+            cleaned_dir = root / "cleaned"
+            masks_dir = root / "masks"
+            images_dir.mkdir()
+            cleaned_dir.mkdir()
+            masks_dir.mkdir()
+
+            original_path = images_dir / "slide_01.png"
+            cleaned_path = cleaned_dir / "slide_01.png"
+            original = Image.new("RGB", (120, 30), (4, 18, 32))
+            pixels = original.load()
+            colors = [(245, 245, 245), (235, 130, 30), (245, 245, 245)]
+            for index, color in enumerate(colors):
+                for x in range(10 + index * 30, 38 + index * 30):
+                    for y in range(6, 22):
+                        pixels[x, y] = color
+            original.save(original_path)
+            Image.new("RGB", (120, 30), (4, 18, 32)).save(cleaned_path)
+
+            project = PPTProject(
+                source_pptx=root / "source.pptx",
+                work_dir=root,
+                images_dir=images_dir,
+                masks_dir=masks_dir,
+                cleaned_dir=cleaned_dir,
+                slides=[
+                    PPTSlide(
+                        index=1,
+                        image_name="slide_01.png",
+                        image_path=original_path,
+                        image_width=120,
+                        image_height=30,
+                        boxes=[
+                            OCRBox(
+                                text="ABC",
+                                score=1.0,
+                                bbox=(10, 6, 90, 16),
+                                erase_rect=(8, 4, 102, 24),
+                            )
+                        ],
+                    )
+                ],
+                slide_width=914400,
+                slide_height=914400,
+            )
+
+            output_path = root / "out.pptx"
+            rebuild_ppt(project, output_path)
+
+            from pptx import Presentation
+
+            deck = Presentation(str(output_path))
+            text_shape = next(shape for shape in deck.slides[0].shapes if getattr(shape, "text", "") == "ABC")
+            runs = text_shape.text_frame.paragraphs[0].runs
+            run_colors = [tuple(run.font.color.rgb) for run in runs]
+            font_sizes = {run.font.size for run in runs}
+
+            self.assertEqual(len(font_sizes), 1)
+            self.assertTrue(any(color[0] > 220 and color[1] > 220 and color[2] > 220 for color in run_colors))
+            self.assertTrue(any(color[0] > 180 and 70 < color[1] < 180 and color[2] < 90 for color in run_colors))
+
+    def test_sample_text_color_uses_light_text_on_dark_background(self):
+        image = Image.new("RGB", (40, 20), (8, 18, 30))
+        pixels = image.load()
+        for x in range(12, 28):
+            for y in range(6, 14):
+                pixels[x, y] = (235, 240, 245)
+
+        color = sample_text_color(image, (8, 4, 32, 16))
+
+        self.assertGreater(sum(tuple(color)), 600)
+
+    def test_sample_text_color_uses_dark_text_on_light_background(self):
+        image = Image.new("RGB", (40, 20), (235, 240, 245))
+        pixels = image.load()
+        for x in range(12, 28):
+            for y in range(6, 14):
+                pixels[x, y] = (8, 18, 30)
+
+        color = sample_text_color(image, (8, 4, 32, 16))
+
+        self.assertLess(sum(tuple(color)), 100)
+
     def test_rebuild_embeds_compressed_jpeg_when_available(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -509,6 +758,97 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
 
         upscale.assert_not_called()
         self.assertIn("已跳过 RealESRGAN 底图清晰化", messages)
+
+
+    def test_project_serialization_preserves_export_state(self):
+        project = PPTProject(
+            source_pptx=Path("source.pptx"),
+            work_dir=Path("work"),
+            images_dir=Path("images"),
+            masks_dir=Path("masks"),
+            cleaned_dir=Path("cleaned"),
+            slides=[
+                PPTSlide(
+                    index=1,
+                    image_name="slide_01.png",
+                    image_path=Path("images/slide_01.png"),
+                    image_width=100,
+                    image_height=80,
+                    boxes=[
+                        OCRBox(
+                            text="Hello",
+                            score=0.9,
+                            bbox=(1, 2, 3, 4),
+                            erase_rect=(1, 2, 10, 12),
+                            enabled=False,
+                            manual=True,
+                            edited=True,
+                            rotation=270,
+                        )
+                    ],
+                    watermark_rect=(70, 60, 99, 79),
+                    remove_watermark=False,
+                    ocr_status="ok",
+                )
+            ],
+            slide_width=914400,
+            slide_height=685800,
+        )
+
+        restored = ppt_project_from_data(ppt_project_to_data(project))
+
+        self.assertEqual(restored.source_pptx, Path("source.pptx"))
+        self.assertEqual(restored.slides[0].watermark_rect, (70, 60, 99, 79))
+        self.assertFalse(restored.slides[0].remove_watermark)
+        self.assertEqual(restored.slides[0].boxes[0].text, "Hello")
+        self.assertEqual(restored.slides[0].boxes[0].rotation, 270)
+
+    def test_export_subprocess_relays_progress_and_returns_output_path(self):
+        class FakeStdout:
+            def __iter__(self):
+                return iter(["step 1\n", "step 2\n"])
+
+        class FakeProcess:
+            stdout = FakeStdout()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                raise AssertionError("unexpected kill")
+
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return FakeProcess()
+
+        project = PPTProject(
+            source_pptx=Path("source.pptx"),
+            work_dir=Path("work"),
+            images_dir=Path("images"),
+            masks_dir=Path("masks"),
+            cleaned_dir=Path("cleaned"),
+            slides=[],
+            slide_width=914400,
+            slide_height=685800,
+        )
+        messages = []
+
+        output = run_export_editable_ppt_subprocess(
+            project,
+            Path("out.pptx"),
+            progress=messages.append,
+            enhance_images=False,
+            popen=fake_popen,
+        )
+
+        self.assertEqual(output, Path("out.pptx"))
+        self.assertIn("step 1", messages)
+        self.assertIn("step 2", messages)
+        self.assertIn("app.export_worker", captured["command"])
+        self.assertEqual(captured["kwargs"]["stderr"], subprocess.STDOUT)
 
 
 if __name__ == "__main__":

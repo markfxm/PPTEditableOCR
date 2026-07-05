@@ -49,9 +49,9 @@ from .core import (
     PPTProject,
     PPTSlide,
     cache_path_candidates,
-    convert_pdf_to_pptx,
-    export_editable_ppt,
     prepare_project,
+    prepare_pdf_project,
+    run_export_editable_ppt_subprocess,
     run_ocr_page_subprocess,
     save_project_cache,
     OCR_BACKEND_LOCAL,
@@ -267,33 +267,33 @@ class ManualDialog(QDialog):
             "基本流程",
             """PPT 预览区上方会显示完整流程，提示每一步该做什么。
 
-1. 如果源文件是 PDF，先点击“打开 PDF”，生成每页一张整页图片的 PPT。
+1. 如果源文件是 PDF，先点击“打开 PDF”，程序会直接载入页面图片，不生成中间 PPT。
 2. 点击“打开 PPT”，导入图片型 PPT。
 3. 程序会提取每页图片；请先在右侧选择本地或远端 OCR，再点击“开始 OCR（按当前选择）”识别文字区域。
 4. OCR 完成后，在中间画布检查蓝色文字框，必要时调整、删除或新增框。
 5. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。""",
         ),
         (
-            "PDF 转 PPT",
-            """PDF 转 PPT：
-点击工具栏“打开 PDF”，选择 .pdf 文件。程序会在 PDF 同目录生成 <PDF名>-from-pdf.pptx。
+            "PDF 导入",
+            """PDF 导入：
+点击工具栏“打开 PDF”，选择 .pdf 文件。程序会直接把 PDF 页面载入内部工作区，不会在 PDF 同目录生成 <PDF名>-from-pdf.pptx。
 
 输出规则：
-如果同名 PPT 已存在，程序会自动追加 -2、-3 等序号，避免覆盖已有文件。
+只有点击“导出可编辑 PPT”时，才会让你选择最终 PPT 的保存位置。
 
 继续编辑：
-转换完成后，生成的 PPT 会自动加入右侧“PPT 列表”并打开。检查 OCR 框后，点击“导出可编辑 PPT”即可继续。""",
+PDF 载入完成后，源 PDF 会自动加入右侧“PPT 列表”并打开。检查 OCR 框后，点击“导出可编辑 PPT”即可继续。""",
         ),
         (
             "PPT 列表",
             """PPT 列表：
-右侧上方会显示本次运行期间打开过的 PPT，以及 PDF 转换后生成的 PPT。
+右侧上方会显示本次运行期间打开过的 PPT 和 PDF。
 
 切换 PPT：
-点击列表中的一个 PPT，程序会自动打开它并刷新左侧页列表和中间预览区。当前仍然一次只编辑一个 PPT。
+点击列表中的一个文件，程序会自动打开它并刷新左侧页列表和中间预览区。当前仍然一次只编辑一个文件。
 
 自动加入：
-点击“打开 PPT”选择的文件会加入列表。PDF 转 PPT 完成后，生成的 PPT 也会自动加入列表并打开。
+点击“打开 PPT”选择的文件会加入列表。PDF 载入完成后，源 PDF 也会自动加入列表并打开。
 
 列表范围：
 这个列表只在本次运行期间保留，关闭软件后会清空。""",
@@ -347,7 +347,7 @@ class ManualDialog(QDialog):
 点击“设置远端 OCR 令牌”可以保存令牌；点击“删除远端 OCR 令牌”会清除令牌，并自动切回本地 OCR。
 
 开始 OCR：
-打开 PPT 或 PDF 转换完成后，程序只提取页面图片，不会自动 OCR。请确认识别方式后点击“开始 OCR（按当前选择）”。如果选择远端 OCR 但令牌缺失或长度不正确，会提示先设置令牌或切换为本地 OCR。""",
+打开 PPT 或 PDF 载入完成后，程序只提取页面图片，不会自动 OCR。请确认识别方式后点击“开始 OCR（按当前选择）”。如果选择远端 OCR 但令牌缺失或长度不正确，会提示先设置令牌或切换为本地 OCR。""",
         ),
         (
             "导出与清晰化",
@@ -792,25 +792,28 @@ class MainWindow(QMainWindow):
         source = Path(path)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_label.setText("准备转换 PDF")
-        self.append_log(f"开始 PDF 转 PPT：{source}")
-        self.run_worker(convert_pdf_to_pptx, self.on_pdf_converted, source)
+        self.progress_label.setText("准备载入 PDF")
+        self.append_log(f"开始载入 PDF：{source}")
+        self.add_ppt_to_recent_list(source, select=True)
+        self.run_worker(
+            prepare_pdf_project,
+            self.on_pdf_loaded,
+            source,
+            auto_ocr=False,
+        )
 
-    def on_pdf_converted(self, output_pptx: Path):
+    def on_pdf_loaded(self, project: PPTProject):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.progress_label.setText("PDF 转 PPT 完成")
-        self.append_log(f"PDF 转 PPT 完成：{output_pptx}")
-        self.add_ppt_to_recent_list(output_pptx, select=True)
-        self.pending_autoload_ppt = output_pptx
-        self.append_log("PDF 转 PPT 完成，请选择 OCR 方式后点击“开始 OCR（按当前选择）”。")
-        QTimer.singleShot(0, self.run_pending_work)
+        self.progress_label.setText("PDF 载入完成")
+        self.append_log(f"PDF 载入完成：{project.source_pptx}")
+        self.on_project_loaded(project)
 
     def open_ppt(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 PPT 文件", "", "PowerPoint (*.pptx)")
         if not path:
             return
-        self.load_ppt_path(Path(path), add_to_list=True, select_in_list=True)
+        self.load_source_path(Path(path), add_to_list=True, select_in_list=True)
 
     def add_ppt_to_recent_list(self, path: Path, select: bool = False) -> int:
         source = path.expanduser().resolve()
@@ -873,6 +876,29 @@ class MainWindow(QMainWindow):
         if progress_text:
             self.progress_label.setText(progress_text)
         self.update_undo_action()
+
+    def load_source_path(
+        self,
+        path: Path,
+        add_to_list: bool = True,
+        select_in_list: bool = True,
+    ):
+        source = path.expanduser().resolve()
+        if source.suffix.lower() == ".pdf":
+            if self.worker_thread:
+                return
+            if add_to_list:
+                self.add_ppt_to_recent_list(source, select=select_in_list)
+            self.clear_current_project()
+            self.append_log(f"开始载入 PDF：{source}")
+            self.run_worker(
+                prepare_pdf_project,
+                self.on_project_loaded,
+                source,
+                auto_ocr=False,
+            )
+            return
+        self.load_ppt_path(source, add_to_list=add_to_list, select_in_list=select_in_list)
 
     def load_ppt_path(
         self,
@@ -1068,7 +1094,7 @@ class MainWindow(QMainWindow):
         source = self.ppt_paths[row]
         if self.project and self.project.source_pptx == source:
             return
-        self.load_ppt_path(source, add_to_list=False, select_in_list=False)
+        self.load_source_path(source, add_to_list=False, select_in_list=False)
 
     def on_project_loaded(self, project: PPTProject):
         self.project = project
@@ -1357,7 +1383,7 @@ class MainWindow(QMainWindow):
         self.save_current_cache(show_message=False, log_success=False)
         self.append_log("开始导出可编辑 PPT")
         self.run_worker(
-            export_editable_ppt,
+            run_export_editable_ppt_subprocess,
             self.on_export_finished,
             self.project,
             out_path,

@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.gui import MainWindow
+from app.gui import prepare_pdf_project
 
 
 class FakeList:
@@ -79,6 +80,26 @@ class PptListRemoveTest(unittest.TestCase):
         self.assertIn("item = QListWidgetItem()", source)
         self.assertNotIn("item = QListWidgetItem(source.name)", source)
         self.assertLess(source.index('layout.addWidget(remove_btn)'), source.index('layout.addWidget(label, 1)'))
+
+    def test_load_pdf_source_uses_direct_pdf_project_loader(self):
+        window = MainWindow.__new__(MainWindow)
+        window.worker_thread = None
+        window.add_ppt_to_recent_list = lambda *_args, **_kwargs: None
+        window.clear_current_project = lambda: None
+        window.append_log = lambda _message: None
+        calls = []
+
+        def fake_run_worker(fn, finished_cb, *args, **kwargs):
+            calls.append((fn, finished_cb, args, kwargs))
+
+        window.run_worker = fake_run_worker
+        window.on_project_loaded = object()
+
+        window.load_source_path(Path("source.pdf"), add_to_list=True, select_in_list=True)
+
+        self.assertEqual(calls[0][0], prepare_pdf_project)
+        self.assertEqual(calls[0][2][0], Path("source.pdf").resolve())
+        self.assertFalse(calls[0][3]["auto_ocr"])
 
 
 if __name__ == "__main__":

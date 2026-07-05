@@ -16,5 +16,13 @@ class GuiLayoutTextTest(unittest.TestCase):
         self.assertNotIn("self.enhance_images_cb.setChecked(True)", source)
 
 
+    def test_pdf_gui_import_uses_direct_project_loading(self):
+        source = Path("app/gui.py").read_text(encoding="utf-8")
+
+        self.assertIn("prepare_pdf_project", source)
+        self.assertNotIn("convert_pdf_to_pptx", source)
+        self.assertNotIn("PDF 载入完成，未生成中间 PPT。请选择 OCR 方式后点击", source)
+
+
 if __name__ == "__main__":
     unittest.main()

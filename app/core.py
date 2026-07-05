@@ -63,6 +63,13 @@ def prefer_system_cuda_torch(
     return False
 
 
+def prepare_iopaint_torch(progress: ProgressCB = None) -> bool:
+    selected = prefer_system_cuda_torch()
+    if selected:
+        _log(progress, "已优先使用系统 CUDA Torch")
+    return selected
+
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -354,7 +361,20 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
     for slide, cached in zip(project.slides, cached_slides):
         slide.remove_watermark = bool(cached.get("remove_watermark", slide.remove_watermark))
         slide.ocr_status = str(cached.get("ocr_status") or ("ok" if cached.get("boxes") else "pending"))
-        slide.watermark_rect = _rect_from_data(cached.get("watermark_rect"), slide.watermark_rect) if cached.get("watermark_rect") else slide.watermark_rect
+        cached_watermark_rect = (
+            _rect_from_data(cached.get("watermark_rect"), slide.watermark_rect)
+            if cached.get("watermark_rect")
+            else slide.watermark_rect
+        )
+        default_rect = default_watermark_rect(slide.image_width, slide.image_height)
+        if cached_watermark_rect is None:
+            cached_watermark_rect = default_rect
+        slide.watermark_rect = (
+            min(cached_watermark_rect[0], default_rect[0]),
+            min(cached_watermark_rect[1], default_rect[1]),
+            max(cached_watermark_rect[2], default_rect[2]),
+            max(cached_watermark_rect[3], default_rect[3]),
+        )
         slide.boxes = []
         for item in cached.get("boxes", []):
             if not isinstance(item, dict):
@@ -440,6 +460,62 @@ def ocr_box_from_data(data: dict) -> OCRBox:
     )
 
 
+def ppt_project_to_data(project: PPTProject) -> dict:
+    return {
+        "source_pptx": str(project.source_pptx),
+        "work_dir": str(project.work_dir),
+        "images_dir": str(project.images_dir),
+        "masks_dir": str(project.masks_dir),
+        "cleaned_dir": str(project.cleaned_dir),
+        "slide_width": int(project.slide_width),
+        "slide_height": int(project.slide_height),
+        "slides": [
+            {
+                "index": int(slide.index),
+                "image_name": slide.image_name,
+                "image_path": str(slide.image_path),
+                "image_width": int(slide.image_width),
+                "image_height": int(slide.image_height),
+                "watermark_rect": _rect_to_list(slide.watermark_rect) if slide.watermark_rect else None,
+                "remove_watermark": bool(slide.remove_watermark),
+                "ocr_status": slide.ocr_status,
+                "boxes": [ocr_box_to_data(box) for box in slide.boxes],
+            }
+            for slide in project.slides
+        ],
+    }
+
+
+def ppt_project_from_data(data: dict) -> PPTProject:
+    slides = []
+    for item in data.get("slides", []):
+        slides.append(
+            PPTSlide(
+                index=int(item["index"]),
+                image_name=str(item["image_name"]),
+                image_path=Path(item["image_path"]),
+                image_width=int(item["image_width"]),
+                image_height=int(item["image_height"]),
+                boxes=[ocr_box_from_data(box) for box in item.get("boxes", [])],
+                watermark_rect=_rect_from_data(item.get("watermark_rect"), (0, 0, 0, 0))
+                if item.get("watermark_rect")
+                else None,
+                remove_watermark=bool(item.get("remove_watermark", True)),
+                ocr_status=str(item.get("ocr_status") or "pending"),
+            )
+        )
+    return PPTProject(
+        source_pptx=Path(data["source_pptx"]),
+        work_dir=Path(data["work_dir"]),
+        images_dir=Path(data["images_dir"]),
+        masks_dir=Path(data["masks_dir"]),
+        cleaned_dir=Path(data["cleaned_dir"]),
+        slides=slides,
+        slide_width=int(data["slide_width"]),
+        slide_height=int(data["slide_height"]),
+    )
+
+
 def build_ocr_boxes(page: dict, slide: PPTSlide) -> list[OCRBox]:
     boxes: list[OCRBox] = []
     for poly, text, score in zip(page["dt_polys"], page["rec_texts"], page["rec_scores"]):
@@ -481,6 +557,17 @@ def fit_rect_to_slide(image_width: int, image_height: int, slide_width: int, sli
     left = int((slide_width - width) / 2)
     top = int((slide_height - height) / 2)
     return left, top, width, height
+
+
+def default_watermark_rect(width: int, height: int) -> tuple[int, int, int, int]:
+    watermark_width = max(260, int(width * 0.16))
+    watermark_height = max(120, int(height * 0.10))
+    return (
+        max(0, width - watermark_width),
+        max(0, height - watermark_height),
+        width - 1,
+        height - 1,
+    )
 
 
 def convert_pdf_to_pptx(source_pdf: Path, output_pptx: Path | None = None, progress: ProgressCB = None) -> Path:
@@ -566,12 +653,6 @@ def extract_slide_images(source_pptx: Path, images_dir: Path, progress: Progress
         out_path.write_bytes(pic.image.blob)
         with Image.open(out_path) as image:
             width, height = image.size
-        watermark_rect = (
-            max(0, width - 190),
-            max(0, height - 90),
-            width - 1,
-            height - 1,
-        )
         extracted.append(
             PPTSlide(
                 index=index,
@@ -579,11 +660,91 @@ def extract_slide_images(source_pptx: Path, images_dir: Path, progress: Progress
                 image_path=out_path,
                 image_width=width,
                 image_height=height,
-                watermark_rect=watermark_rect,
+                watermark_rect=default_watermark_rect(width, height),
             )
         )
         _log(progress, f"提取第 {index} 页图片")
     return src, extracted
+
+
+def prepare_pdf_project(
+    source_pdf: Path,
+    work_dir: Path | None = None,
+    progress: ProgressCB = None,
+    auto_ocr: bool = False,
+    ocr_backend: str = OCR_BACKEND_LOCAL,
+    ocr_token: str | None = None,
+) -> PPTProject:
+    import pypdfium2
+
+    source_pdf = source_pdf.expanduser().resolve()
+    if work_dir is None:
+        work_dir = BASE / "_gui_workspace" / source_pdf.stem
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    images_dir = work_dir / "images"
+    masks_dir = work_dir / "masks"
+    cleaned_dir = work_dir / "cleaned"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    _log(progress, f"开始加载 PDF：{source_pdf}")
+    pdf = pypdfium2.PdfDocument(str(source_pdf))
+    try:
+        page_count = len(pdf)
+        if page_count <= 0:
+            raise RuntimeError(f"PDF 没有可转换页面：{source_pdf}")
+
+        first_page = pdf[0]
+        first_width, first_height = first_page.get_size()
+        first_page.close()
+        if first_width <= 0 or first_height <= 0:
+            raise RuntimeError(f"PDF 首页尺寸无效：{source_pdf}")
+
+        slide_width = int(DEFAULT_PPT_WIDTH)
+        slide_height = int(DEFAULT_PPT_WIDTH * first_height / first_width)
+        slides: list[PPTSlide] = []
+        _progress(progress, 0, f"PDF 页面载入：0/{page_count}")
+        for page_index in range(page_count):
+            page = pdf[page_index]
+            image_name = f"slide_{page_index + 1:02d}.png"
+            image_path = images_dir / image_name
+            bitmap = page.render(scale=2)
+            image = bitmap.to_pil().convert("RGB")
+            image_width, image_height = image.size
+            image.save(image_path)
+            bitmap.close()
+            page.close()
+            slides.append(
+                PPTSlide(
+                    index=page_index + 1,
+                    image_name=image_name,
+                    image_path=image_path,
+                    image_width=image_width,
+                    image_height=image_height,
+                    watermark_rect=default_watermark_rect(image_width, image_height),
+                )
+            )
+            done = page_index + 1
+            _progress(progress, int(done * 100 / page_count), f"PDF 页面载入：{done}/{page_count}")
+            _log(progress, f"第 {done} 页 PDF 图片已载入")
+    finally:
+        pdf.close()
+
+    project = PPTProject(
+        source_pptx=source_pdf,
+        work_dir=work_dir,
+        images_dir=images_dir,
+        masks_dir=masks_dir,
+        cleaned_dir=cleaned_dir,
+        slides=slides,
+        slide_width=slide_width,
+        slide_height=slide_height,
+    )
+    if not load_project_cache(project, progress=progress) and auto_ocr:
+        run_ocr(slides, progress, ocr_backend=ocr_backend, ocr_token=ocr_token)
+    _log(progress, "PDF 已载入工作区，未生成中间 PPT")
+    return project
 
 
 def _make_remote_ocr_options(OCROptions):
@@ -768,6 +929,71 @@ def run_ocr_page_subprocess(
     return [ocr_box_from_data(item) for item in payload.get("boxes", [])]
 
 
+def run_export_editable_ppt_subprocess(
+    project: PPTProject,
+    output_pptx: Path,
+    progress: ProgressCB = None,
+    enhance_images: bool = True,
+    popen=subprocess.Popen,
+    timeout: int | None = None,
+) -> Path:
+    _log(progress, "启动独立导出进程")
+    with tempfile.TemporaryDirectory(prefix="ppttoedit_export_") as temp_dir:
+        temp_root = Path(temp_dir)
+        input_path = temp_root / "input.json"
+        payload = {
+            "project": ppt_project_to_data(project),
+            "output_pptx": str(output_pptx),
+            "enhance_images": bool(enhance_images),
+        }
+        input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONFAULTHANDLER", "1")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--export-worker", str(input_path)]
+        else:
+            command = [
+                sys.executable,
+                "-X",
+                "faulthandler",
+                "-m",
+                "app.export_worker",
+                str(input_path),
+            ]
+
+        process = popen(
+            command,
+            cwd=str(BASE),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        stdout_lines: list[str] = []
+        if process.stdout is not None:
+            for line in process.stdout:
+                message = line.rstrip("\r\n")
+                stdout_lines.append(message)
+                if message:
+                    _log(progress, message)
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            raise RuntimeError("导出子进程超时。") from exc
+
+        output = "\n".join(stdout_lines)
+        if returncode != 0:
+            raise RuntimeError(f"导出子进程异常退出（代码 {returncode}）。\n{output}")
+
+    return output_pptx
+
+
 def run_ocr(
     slides: list[PPTSlide],
     progress: ProgressCB = None,
@@ -910,6 +1136,8 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
         if key in env:
             os.environ[key] = env[key]
 
+    prepare_iopaint_torch(progress)
+
     from iopaint.download import cli_download_model, scan_models
     from iopaint.helper import pil_to_bytes
     from iopaint.model.utils import torch_gc
@@ -1035,6 +1263,8 @@ def upscale_cleaned_images(cleaned_dir: Path, scale: float = 2.0, progress: Prog
         if key in env:
             os.environ[key] = env[key]
 
+    prepare_iopaint_torch(progress)
+
     from iopaint.model.utils import torch_gc
     from iopaint.plugins import RealESRGANUpscaler
     from iopaint.schema import Device, RunPluginRequest
@@ -1114,16 +1344,86 @@ def cleaned_image_path(cleaned_dir: Path, name: str):
     raise FileNotFoundError(name)
 
 
-def sample_text_color(image: Image.Image, rect):
+def sample_text_color(image: Image.Image, rect, background_brightness: float | None = None):
     region = image.crop(rect).convert("RGB")
     arr = np.asarray(region)
     if arr.size == 0:
         return RGBColor(0, 0, 0)
     flat = arr.reshape(-1, 3)
-    brightness = flat.sum(axis=1)
-    sample = flat[np.argsort(brightness)[: max(1, len(flat) // 8)]]
+    brightness = flat.astype(np.int32).sum(axis=1)
+    if background_brightness is None:
+        if arr.shape[0] > 2 and arr.shape[1] > 2:
+            border = np.concatenate([arr[0, :, :], arr[-1, :, :], arr[:, 0, :], arr[:, -1, :]], axis=0)
+        else:
+            border = flat
+        background_brightness = float(border.astype(np.int32).sum(axis=1).mean())
+    sorted_indexes = np.argsort(brightness)
+    sample_size = max(1, len(flat) // 8)
+    if background_brightness < 382:
+        sample = flat[sorted_indexes[-sample_size:]]
+    else:
+        sample = flat[sorted_indexes[:sample_size]]
     rgb = sample.mean(axis=0).astype(int)
     return RGBColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+def quantize_rgb_color(color: RGBColor, step: int = 24) -> RGBColor:
+    channels = []
+    for value in tuple(color):
+        quantized = int(round(int(value) / step) * step)
+        channels.append(max(0, min(255, quantized)))
+    return RGBColor(*channels)
+
+
+def character_color_runs(image: Image.Image, box: OCRBox, rotate_text: bool = False) -> list[tuple[str, RGBColor]]:
+    text = box.text
+    if not text:
+        return []
+
+    x, y, w, h = box.bbox
+    runs: list[tuple[str, RGBColor]] = []
+    current_text = ""
+    current_color: RGBColor | None = None
+    total = max(1, len(text))
+    background_region = image.crop(box.erase_rect).convert("RGB")
+    background_arr = np.asarray(background_region)
+    background_brightness = None
+    if background_arr.size:
+        if background_arr.shape[0] > 2 and background_arr.shape[1] > 2:
+            border = np.concatenate(
+                [
+                    background_arr[0, :, :],
+                    background_arr[-1, :, :],
+                    background_arr[:, 0, :],
+                    background_arr[:, -1, :],
+                ],
+                axis=0,
+            )
+        else:
+            border = background_arr.reshape(-1, 3)
+        background_brightness = float(border.astype(np.int32).sum(axis=1).mean())
+
+    for index, char in enumerate(text):
+        if rotate_text:
+            top = y + int(index * h / total)
+            bottom = y + int((index + 1) * h / total)
+            rect = (x, top, x + w, max(top + 1, bottom))
+        else:
+            left = x + int(index * w / total)
+            right = x + int((index + 1) * w / total)
+            rect = (left, y, max(left + 1, right), y + h)
+        color = quantize_rgb_color(sample_text_color(image, rect, background_brightness=background_brightness))
+        if current_color is not None and color == current_color:
+            current_text += char
+            continue
+        if current_text and current_color is not None:
+            runs.append((current_text, current_color))
+        current_text = char
+        current_color = color
+
+    if current_text and current_color is not None:
+        runs.append((current_text, current_color))
+    return runs
 
 
 def should_rotate_text(box: OCRBox) -> bool:
@@ -1170,11 +1470,16 @@ def add_textbox(slide, color_image, box: OCRBox, x_scale: float, y_scale: float)
 
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.LEFT
-    run = p.add_run()
-    run.text = text
-    run.font.name = "Microsoft YaHei"
-    run.font.size = Pt(max(8, font_axis * 0.72 / 12700))
-    run.font.color.rgb = sample_text_color(color_image, box.erase_rect)
+    font_size = Pt(max(8, font_axis * 0.72 / 12700))
+    runs = character_color_runs(color_image, box, rotate_text=rotate_text) or [
+        (text, sample_text_color(color_image, box.bbox))
+    ]
+    for run_text, color in runs:
+        run = p.add_run()
+        run.text = run_text
+        run.font.name = "Microsoft YaHei"
+        run.font.size = font_size
+        run.font.color.rgb = color
     return True
 
 

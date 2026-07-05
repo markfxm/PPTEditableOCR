@@ -73,7 +73,7 @@ Docker 部署入口在 `web_deploy/docker-compose.yml`，包含 `api`、`worker`
 
 桌面版 PPT 预览区上方有一条流程图，会显示从导入到导出的完整步骤。
 
-1. 如果源文件是 PDF，点击“打开 PDF”，程序会在 PDF 同目录生成 `<PDF名>-from-pdf.pptx`。
+1. 如果源文件是 PDF，点击“打开 PDF”，程序会直接把 PDF 页面载入内部工作区，不再生成 `<PDF名>-from-pdf.pptx` 中间 PPT。
 2. 如果源文件已经是图片型 PPT，点击“打开 PPT”直接导入。
 3. 程序提取每页图片，但不会自动 OCR。
 4. 在右侧“OCR 设置”中选择“本地 PaddleOCR”或“远端 PaddleOCR”，然后点击“开始 OCR（按当前选择）”。

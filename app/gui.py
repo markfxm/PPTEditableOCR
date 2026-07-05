@@ -326,9 +326,6 @@ PDF 载入完成后，源 PDF 会自动加入右侧“PPT 列表”并打开。�
 新增框：
 手动添加一个框。新增框会先显示在当前页右上角区域，方便找到；之后可以拖动、缩放到目标文字位置，并在下方文本框输入正确内容。适合 OCR 漏识别的文字，尤其是竖向坐标轴文字或低置信度文字。
 
-选中框参与擦除和重建：
-勾选后，导出时会擦除这个区域的原图文字，并重建为可编辑文本。取消勾选后，该框不会参与导出处理。
-
 清除当前页右下角水印区域：
 导出时额外擦除右下角预设水印区域，比如 NotebookLM 标记。这个选项不依赖选中的文字框。
 
@@ -363,7 +360,7 @@ RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等�
         (
             "保存识别框",
             """保存识别框：
-点击工具栏“保存识别框”，会把当前 PPT 的 OCR 框、手动新增框、文本修正、是否参与擦除、旋转信息、水印开关等保存到缓存文件。
+点击工具栏“保存识别框”，会把当前 PPT 的 OCR 框、手动新增框、文本修正、旋转信息、水印开关等保存到缓存文件。
 
 导出时保存：
 点击“导出可编辑 PPT”时，程序会先自动保存一次识别框，再开始导出。这样可以先放心调整框，确认后再把最终状态写入缓存。
@@ -382,7 +379,7 @@ RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等�
             """点击“撤销”或按 Ctrl+Z，可以撤销上一步框编辑操作。
 
 支持撤销：
-拖拽、缩放、新增、删除、重算边距、修改文本、切换“参与擦除和重建”。
+拖拽、缩放、新增、删除、重算边距、修改文本。
 
 不撤销：
 水印区域开关。""",
@@ -393,7 +390,7 @@ RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等�
 这通常是 OCR 对局部旋转 90 度文字识别不稳定。可以手动新增窄高框，输入正确文本，再导出。
 
 文字导出后不见：
-请确认该框已勾选“参与擦除和重建”，并且文本输入框里有正确内容。
+请确认文本输入框里有正确内容，并且该框没有被删除。
 
 擦除后有残留：
 适当增大横向/纵向边距，然后对当前页或选中框按边距重算。
@@ -578,10 +575,6 @@ class MainWindow(QMainWindow):
         self.add_box_btn.clicked.connect(self.add_box)
         side_layout.addWidget(self.add_box_btn)
 
-        self.toggle_box_cb = QCheckBox("选中框参与擦除和重建")
-        self.toggle_box_cb.stateChanged.connect(self.on_selected_box_toggle)
-        side_layout.addWidget(self.toggle_box_cb)
-
         self.watermark_cb = QCheckBox("清除当前页右下角水印区域")
         self.watermark_cb.setChecked(True)
         self.watermark_cb.stateChanged.connect(self.on_watermark_toggle)
@@ -726,7 +719,6 @@ class MainWindow(QMainWindow):
         self.reset_box_btn.setEnabled(not busy)
         self.delete_box_btn.setEnabled(not busy)
         self.add_box_btn.setEnabled(not busy)
-        self.toggle_box_cb.setEnabled(not busy)
         self.watermark_cb.setEnabled(not busy)
         self.text_edit.setEnabled(not busy)
         self.start_ocr_btn.setEnabled((not busy) and self.project is not None)
@@ -1263,9 +1255,6 @@ class MainWindow(QMainWindow):
         self.selected_item = items[0] if items else None
         if not self.selected_item:
             self.selected_info.setText("未选择任何框")
-            self.toggle_box_cb.blockSignals(True)
-            self.toggle_box_cb.setChecked(False)
-            self.toggle_box_cb.blockSignals(False)
             self.text_edit.blockSignals(True)
             self.text_edit.clear()
             self.text_edit.blockSignals(False)
@@ -1277,9 +1266,6 @@ class MainWindow(QMainWindow):
             f"原始 bbox：{box.bbox}\n"
             f"擦除框：{box.erase_rect}"
         )
-        self.toggle_box_cb.blockSignals(True)
-        self.toggle_box_cb.setChecked(box.enabled)
-        self.toggle_box_cb.blockSignals(False)
         self.text_edit.blockSignals(True)
         self.text_edit.setText(box.text)
         self.text_edit.blockSignals(False)
@@ -1342,17 +1328,6 @@ class MainWindow(QMainWindow):
         self.push_undo_state()
         self.selected_item.box.text = new_text
         self.selected_item.box.edited = True
-        self.on_scene_selection_changed()
-
-    def on_selected_box_toggle(self, state: int):
-        if not self.selected_item:
-            return
-        enabled = state == Qt.CheckState.Checked.value
-        if enabled == self.selected_item.box.enabled:
-            return
-        self.push_undo_state()
-        self.selected_item.box.enabled = enabled
-        self.selected_item._update_pen()
         self.on_scene_selection_changed()
 
     def on_watermark_toggle(self, state: int):

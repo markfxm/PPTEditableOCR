@@ -375,11 +375,9 @@ function updateInspector(updateText = true) {
   $("padXInput").disabled = !state.currentSlide;
   $("padYInput").disabled = !state.currentSlide;
   $("textInput").disabled = !hasBox;
-  $("enabledInput").disabled = !hasBox;
   $("watermarkInput").disabled = !state.currentSlide;
   $("rotationInput").disabled = !hasBox;
   if (updateText) $("textInput").value = box?.text || "";
-  $("enabledInput").checked = box?.enabled !== false;
   $("watermarkInput").checked = state.currentSlide?.removeWatermark !== false;
   $("rotationInput").value = String(box?.rotation || 0);
   $("selectionLabel").textContent = hasBox ? `第${state.currentSlide.index}页 - 第${state.selectedIndex + 1}个框` : "未选择任何框";
@@ -422,15 +420,6 @@ $("textInput").addEventListener("input", () => {
   if (!box) return;
   box.text = $("textInput").value;
   box.edited = true;
-  scheduleSave();
-});
-
-$("enabledInput").addEventListener("change", () => {
-  const box = state.currentSlide?.boxes[state.selectedIndex];
-  if (!box) return;
-  box.enabled = $("enabledInput").checked;
-  box.edited = true;
-  draw();
   scheduleSave();
 });
 

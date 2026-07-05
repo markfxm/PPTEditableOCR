@@ -28,6 +28,7 @@ from app.core import (
     run_iopaint,
     sample_text_color,
     default_watermark_rect,
+    build_ocr_boxes,
     build_masks,
     load_project_cache,
     save_compressed_cleaned_image,
@@ -36,6 +37,28 @@ from app.core import (
 
 
 class UpscaleCleanedImagesTest(unittest.TestCase):
+    def test_build_ocr_boxes_omits_notebooklm_watermark_text(self):
+        slide = PPTSlide(
+            index=1,
+            image_path=Path("slide.png"),
+            image_name="slide.png",
+            image_width=1000,
+            image_height=600,
+        )
+        page = {
+            "dt_polys": [
+                [[10, 10], [60, 10], [60, 30], [10, 30]],
+                [[900, 560], [990, 560], [990, 590], [900, 590]],
+            ],
+            "rec_texts": ["Title", "NotebookLM"],
+            "rec_scores": [0.99, 0.99],
+        }
+
+        boxes = build_ocr_boxes(page, slide)
+
+        self.assertEqual([box.text for box in boxes], ["Title"])
+        self.assertTrue(boxes[0].enabled)
+
     def test_prefer_system_cuda_torch_keeps_cuda_module_loaded(self):
         loaded_modules = {}
         cuda_torch = types.SimpleNamespace(
@@ -378,9 +401,17 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
 
             calls = []
 
-            class FakeModelManager:
-                def __init__(self, name, device):
-                    calls.append(("init", name, device))
+            class FakeLaMa:
+                @staticmethod
+                def is_downloaded():
+                    return True
+
+                @staticmethod
+                def download():
+                    calls.append(("download", "lama"))
+
+                def __init__(self, device):
+                    calls.append(("init", "lama", device))
 
                 def __call__(self, image, mask, request):
                     calls.append(("call", tuple(image[0, 0]), int(mask[0, 0])))
@@ -389,9 +420,6 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             class FakeRequest:
                 pass
 
-            download_module = types.ModuleType("iopaint.download")
-            download_module.scan_models = lambda: [types.SimpleNamespace(name="lama")]
-            download_module.cli_download_model = lambda name: calls.append(("download", name))
             helper_module = types.ModuleType("iopaint.helper")
 
             def fake_pil_to_bytes(image, output_format, quality, infos):
@@ -402,10 +430,12 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
                 return buffer.getvalue()
 
             helper_module.pil_to_bytes = fake_pil_to_bytes
+            model_package = types.ModuleType("iopaint.model")
+            model_package.__path__ = []
+            lama_module = types.ModuleType("iopaint.model.lama")
+            lama_module.LaMa = FakeLaMa
             model_utils_module = types.ModuleType("iopaint.model.utils")
             model_utils_module.torch_gc = lambda: calls.append(("torch_gc",))
-            model_manager_module = types.ModuleType("iopaint.model_manager")
-            model_manager_module.ModelManager = FakeModelManager
             schema_module = types.ModuleType("iopaint.schema")
             schema_module.Device = types.SimpleNamespace(cpu="cpu", cuda="cuda")
             schema_module.InpaintRequest = FakeRequest
@@ -415,10 +445,10 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             with unittest.mock.patch.dict(
                 sys.modules,
                 {
-                    "iopaint.download": download_module,
                     "iopaint.helper": helper_module,
+                    "iopaint.model": model_package,
+                    "iopaint.model.lama": lama_module,
                     "iopaint.model.utils": model_utils_module,
-                    "iopaint.model_manager": model_manager_module,
                     "iopaint.schema": schema_module,
                     "torch": torch_module,
                 },
@@ -443,10 +473,18 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
 
             calls = []
 
-            class FakeModelManager:
-                def __init__(self, name, device):
+            class FakeLaMa:
+                @staticmethod
+                def is_downloaded():
+                    return True
+
+                @staticmethod
+                def download():
+                    calls.append(("download", "lama"))
+
+                def __init__(self, device):
                     self.device = device
-                    calls.append(("init", name, device))
+                    calls.append(("init", "lama", device))
 
                 def __call__(self, image, mask, request):
                     calls.append(("call", self.device))
@@ -457,9 +495,6 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             class FakeRequest:
                 pass
 
-            download_module = types.ModuleType("iopaint.download")
-            download_module.scan_models = lambda: [types.SimpleNamespace(name="lama")]
-            download_module.cli_download_model = lambda name: calls.append(("download", name))
             helper_module = types.ModuleType("iopaint.helper")
 
             def fake_pil_to_bytes(image, output_format, quality, infos):
@@ -470,10 +505,12 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
                 return buffer.getvalue()
 
             helper_module.pil_to_bytes = fake_pil_to_bytes
+            model_package = types.ModuleType("iopaint.model")
+            model_package.__path__ = []
+            lama_module = types.ModuleType("iopaint.model.lama")
+            lama_module.LaMa = FakeLaMa
             model_utils_module = types.ModuleType("iopaint.model.utils")
             model_utils_module.torch_gc = lambda: calls.append(("torch_gc",))
-            model_manager_module = types.ModuleType("iopaint.model_manager")
-            model_manager_module.ModelManager = FakeModelManager
             schema_module = types.ModuleType("iopaint.schema")
             schema_module.Device = types.SimpleNamespace(cpu="cpu", cuda="cuda")
             schema_module.InpaintRequest = FakeRequest
@@ -483,10 +520,10 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             with unittest.mock.patch.dict(
                 sys.modules,
                 {
-                    "iopaint.download": download_module,
                     "iopaint.helper": helper_module,
+                    "iopaint.model": model_package,
+                    "iopaint.model.lama": lama_module,
                     "iopaint.model.utils": model_utils_module,
-                    "iopaint.model_manager": model_manager_module,
                     "iopaint.schema": schema_module,
                     "torch": torch_module,
                 },

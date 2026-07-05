@@ -10,6 +10,8 @@ import hashlib
 import tempfile
 import traceback
 import importlib
+import importlib.util
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -174,6 +176,36 @@ def bundled_ocr_model_dir(model_name: str) -> Path | None:
 def bundled_iopaint_model_root() -> Path | None:
     root = bundled_models_root()
     return root if root and (root / "torch" / "hub" / "checkpoints" / "big-lama.pt").exists() else None
+
+
+def load_iopaint_lama_class():
+    module = sys.modules.get("iopaint.model.lama")
+    if module is not None and hasattr(module, "LaMa"):
+        return module.LaMa
+
+    iopaint_spec = importlib.util.find_spec("iopaint")
+    package_locations = list(iopaint_spec.submodule_search_locations or []) if iopaint_spec else []
+    if not package_locations:
+        raise RuntimeError("未找到 IOPaint 运行依赖。")
+
+    model_dir = Path(package_locations[0]) / "model"
+    lama_path = model_dir / "lama.py"
+    if not lama_path.exists():
+        raise RuntimeError(f"未找到 IOPaint LaMa 模块：{lama_path}")
+
+    if "iopaint.model" not in sys.modules:
+        package = types.ModuleType("iopaint.model")
+        package.__path__ = [str(model_dir)]  # type: ignore[attr-defined]
+        package.__package__ = "iopaint"
+        sys.modules["iopaint.model"] = package
+
+    spec = importlib.util.spec_from_file_location("iopaint.model.lama", lama_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 IOPaint LaMa 模块：{lama_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["iopaint.model.lama"] = module
+    spec.loader.exec_module(module)
+    return module.LaMa
 
 
 @dataclass
@@ -522,6 +554,8 @@ def build_ocr_boxes(page: dict, slide: PPTSlide) -> list[OCRBox]:
         text = (text or "").strip()
         if not text:
             continue
+        if text in SKIP_TEXTS:
+            continue
         x, y, w, h = box_to_rect(poly)
         erase_rect = default_expand_rect(x, y, w, h, slide.image_width, slide.image_height)
         boxes.append(
@@ -530,7 +564,6 @@ def build_ocr_boxes(page: dict, slide: PPTSlide) -> list[OCRBox]:
                 score=float(score),
                 bbox=(x, y, w, h),
                 erase_rect=erase_rect,
-                enabled=text not in SKIP_TEXTS,
             )
         )
     return boxes
@@ -885,6 +918,7 @@ def run_ocr_page_subprocess(
         )
         env = os.environ.copy()
         env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONFAULTHANDLER", "1")
         try:
             if getattr(sys, "frozen", False):
@@ -950,6 +984,7 @@ def run_export_editable_ppt_subprocess(
 
         env = os.environ.copy()
         env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONFAULTHANDLER", "1")
         env.setdefault("PYTHONUNBUFFERED", "1")
         if getattr(sys, "frozen", False):
@@ -1138,10 +1173,9 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
 
     prepare_iopaint_torch(progress)
 
-    from iopaint.download import cli_download_model, scan_models
+    LaMa = load_iopaint_lama_class()
     from iopaint.helper import pil_to_bytes
     from iopaint.model.utils import torch_gc
-    from iopaint.model_manager import ModelManager
     from iopaint.schema import Device, InpaintRequest
 
     image_paths = {
@@ -1162,15 +1196,15 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
     total_images = len(image_paths)
     _progress(progress, 0, f"IOPaint 擦除处理中：0/{total_images}")
 
-    if "lama" not in [model.name for model in scan_models()]:
+    if not LaMa.is_downloaded():
         _log(progress, "本机未找到 IOPaint lama 模型，开始准备模型")
-        cli_download_model("lama")
+        LaMa.download()
 
     first_mask = next(iter(mask_paths.values()))
 
     def process_with_device(device) -> None:
         _log(progress, f"IOPaint 使用设备：{device}")
-        model_manager = ModelManager(name="lama", device=device)
+        model = LaMa(device=device)
         inpaint_request = InpaintRequest()
         for done, (stem, image_path) in enumerate(sorted(image_paths.items()), start=1):
             mask_path = mask_paths.get(stem, first_mask)
@@ -1189,7 +1223,7 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
             mask[mask >= 127] = 255
             mask[mask < 127] = 0
 
-            result = model_manager(image, mask, inpaint_request)
+            result = model(image, mask, inpaint_request)
             result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
             output_path = cleaned_dir / f"{stem}.png"
             result_image = Image.fromarray(result)

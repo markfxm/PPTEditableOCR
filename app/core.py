@@ -33,14 +33,18 @@ def prefer_system_cuda_torch(
     original_sys_path: list[str] | None = None,
     bundled_paths: set[Path] | None = None,
     import_module=importlib.import_module,
+    frozen_app: bool | None = None,
 ) -> bool:
     if "torch" in sys.modules:
         return bool(getattr(getattr(sys.modules["torch"], "cuda", None), "is_available", lambda: False)())
 
+    if frozen_app is None:
+        frozen_app = bool(getattr(sys, "frozen", False))
     original_sys_path = list(original_sys_path or ORIGINAL_SYS_PATH)
     bundled_paths = {path.resolve() for path in (bundled_paths or {IOPAINT_DEPS_DIR, DEPS_DIR})}
     current_sys_path = list(sys.path)
     before_modules = set(sys.modules)
+    keep_imported_torch = False
     try:
         sys.path[:] = [
             path
@@ -52,16 +56,27 @@ def prefer_system_cuda_torch(
         is_available = getattr(cuda, "is_available", None)
         if callable(is_available) and is_available():
             import_module("torchvision")
+            keep_imported_torch = True
             return True
+        if frozen_app:
+            keep_imported_torch = True
     except Exception:
+        new_torch_modules = [
+            name
+            for name in list(sys.modules)
+            if name not in before_modules and (name == "torch" or name.startswith("torch."))
+        ]
+        if frozen_app and new_torch_modules:
+            keep_imported_torch = True
         pass
     finally:
         sys.path[:] = current_sys_path
 
-    for name in list(sys.modules):
-        if name == "torch" or name.startswith("torch."):
-            if name not in before_modules:
-                sys.modules.pop(name, None)
+    if not keep_imported_torch:
+        for name in list(sys.modules):
+            if name == "torch" or name.startswith("torch."):
+                if name not in before_modules:
+                    sys.modules.pop(name, None)
     return False
 
 
@@ -983,10 +998,10 @@ def run_export_editable_ppt_subprocess(
         input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
         env = os.environ.copy()
-        env.setdefault("PYTHONUTF8", "1")
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONFAULTHANDLER", "1")
-        env.setdefault("PYTHONUNBUFFERED", "1")
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONFAULTHANDLER"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
         if getattr(sys, "frozen", False):
             command = [sys.executable, "--export-worker", str(input_path)]
         else:

@@ -134,6 +134,32 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             self.assertNotIn("torch", sys.modules)
             self.assertNotIn("torch.cuda", sys.modules)
 
+    def test_prefer_system_cuda_torch_keeps_frozen_cpu_module_loaded(self):
+        cpu_torch = types.SimpleNamespace(
+            __name__="torch",
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        )
+        torch_cuda = types.SimpleNamespace()
+
+        def fake_import(name):
+            if name == "torch":
+                sys.modules[name] = cpu_torch
+                sys.modules["torch.cuda"] = torch_cuda
+                return cpu_torch
+            raise AssertionError(name)
+
+        with unittest.mock.patch.dict(sys.modules, {}, clear=True):
+            selected = prefer_system_cuda_torch(
+                original_sys_path=["system-site-packages"],
+                bundled_paths={Path("bundled")},
+                import_module=fake_import,
+                frozen_app=True,
+            )
+
+            self.assertFalse(selected)
+            self.assertIs(sys.modules["torch"], cpu_torch)
+            self.assertIs(sys.modules["torch.cuda"], torch_cuda)
+
     def test_prepare_iopaint_torch_logs_when_system_cuda_torch_selected(self):
         messages = []
         with unittest.mock.patch("app.core.prefer_system_cuda_torch", return_value=True):
@@ -886,6 +912,8 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
         self.assertIn("step 2", messages)
         self.assertIn("app.export_worker", captured["command"])
         self.assertEqual(captured["kwargs"]["stderr"], subprocess.STDOUT)
+        self.assertEqual(captured["kwargs"]["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(captured["kwargs"]["env"]["PYTHONIOENCODING"], "utf-8")
 
 
 if __name__ == "__main__":

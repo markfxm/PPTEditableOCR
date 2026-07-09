@@ -1032,6 +1032,7 @@ def add_textbox(slide, color_image, box: OCRBox, x_scale: float, y_scale: float)
     run = p.add_run()
     run.text = text
     run.font.name = "Microsoft YaHei"
+    run.font.bold = True
     run.font.size = Pt(max(8, font_axis * 0.72 / 12700))
     run.font.color.rgb = sample_text_color(color_image, box.erase_rect)
     return True

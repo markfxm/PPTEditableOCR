@@ -1560,6 +1560,13 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
         y_scale = out.slide_height / slide_data.image_height
         count = 0
         for box in slide_data.boxes:
+            if slide_data.remove_watermark and slide_data.watermark_rect:
+                x, y, width, height = box.bbox
+                center_x = x + width / 2
+                center_y = y + height / 2
+                left, top, right, bottom = slide_data.watermark_rect
+                if left <= center_x <= right and top <= center_y <= bottom:
+                    continue
             if add_textbox(dst, color_image, box, x_scale, y_scale):
                 count += 1
         _log(progress, f"第 {slide_data.index} 页已重建 {count} 个可编辑文本框")

@@ -612,6 +612,65 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             text_shape = next(shape for shape in deck.slides[0].shapes if getattr(shape, "text", "") == "Hello")
             self.assertEqual(text_shape.left, 457200)
 
+    def test_rebuild_omits_ocr_text_inside_enabled_watermark_region(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images_dir = root / "images"
+            cleaned_dir = root / "cleaned"
+            masks_dir = root / "masks"
+            images_dir.mkdir()
+            cleaned_dir.mkdir()
+            masks_dir.mkdir()
+
+            original_path = images_dir / "slide_01.png"
+            cleaned_path = cleaned_dir / "slide_01.png"
+            Image.new("RGB", (100, 100), (255, 255, 255)).save(original_path)
+            Image.new("RGB", (100, 100), (255, 255, 255)).save(cleaned_path)
+
+            project = PPTProject(
+                source_pptx=root / "source.pptx",
+                work_dir=root,
+                images_dir=images_dir,
+                masks_dir=masks_dir,
+                cleaned_dir=cleaned_dir,
+                slides=[
+                    PPTSlide(
+                        index=1,
+                        image_name="slide_01.png",
+                        image_path=original_path,
+                        image_width=100,
+                        image_height=100,
+                        boxes=[
+                            OCRBox(
+                                text="Heading",
+                                score=1.0,
+                                bbox=(10, 10, 30, 10),
+                                erase_rect=(10, 10, 40, 20),
+                            ),
+                            OCRBox(
+                                text="Gemini Notebook",
+                                score=0.96,
+                                bbox=(75, 85, 20, 10),
+                                erase_rect=(73, 83, 97, 97),
+                            ),
+                        ],
+                        watermark_rect=(70, 80, 99, 99),
+                        remove_watermark=True,
+                    )
+                ],
+                slide_width=914400,
+                slide_height=914400,
+            )
+
+            output_path = root / "out.pptx"
+            rebuild_ppt(project, output_path)
+
+            from pptx import Presentation
+
+            deck = Presentation(str(output_path))
+            texts = [shape.text for shape in deck.slides[0].shapes if getattr(shape, "text", "")]
+            self.assertEqual(texts, ["Heading"])
+
     def test_rebuild_preserves_light_text_color_on_dark_background(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

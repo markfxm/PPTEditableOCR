@@ -395,6 +395,7 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
             cache_path.write_text(
                 json.dumps(
                     {
+                        "version": 2,
                         "slides": [
                             {
                                 "index": 1,

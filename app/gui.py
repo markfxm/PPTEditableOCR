@@ -68,7 +68,19 @@ FLOW_TEXT = (
     "5. 选择是否清晰化 --> 6. 导出可编辑 PPT"
 )
 
-BoxSnapshot = list[tuple[str, float, tuple[int, int, int, int], tuple[int, int, int, int], bool, bool, bool, int]]
+BoxSnapshot = list[
+    tuple[
+        str,
+        float,
+        tuple[int, int, int, int],
+        tuple[int, int, int, int],
+        bool,
+        bool,
+        bool,
+        int,
+        int | None,
+    ]
+]
 
 
 def page_list_text(index: int, box_count: int, status: str = "ok") -> str:
@@ -1179,7 +1191,17 @@ class MainWindow(QMainWindow):
 
     def snapshot_boxes(self, slide: PPTSlide) -> BoxSnapshot:
         return [
-            (box.text, box.score, box.bbox, box.erase_rect, box.enabled, box.manual, box.edited, box.rotation)
+            (
+                box.text,
+                box.score,
+                box.bbox,
+                box.erase_rect,
+                box.enabled,
+                box.manual,
+                box.edited,
+                box.rotation,
+                box.line_height,
+            )
             for box in slide.boxes
         ]
 
@@ -1194,8 +1216,9 @@ class MainWindow(QMainWindow):
                 manual=manual,
                 edited=edited,
                 rotation=rotation,
+                line_height=line_height,
             )
-            for text, score, bbox, erase_rect, enabled, manual, edited, rotation in snapshot
+            for text, score, bbox, erase_rect, enabled, manual, edited, rotation, line_height in snapshot
         ]
 
     def push_undo_state(self):

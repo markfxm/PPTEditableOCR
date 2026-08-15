@@ -109,6 +109,7 @@ def box_to_dict(box: OCRBox) -> dict[str, Any]:
         "manual": bool(box.manual),
         "edited": bool(box.edited),
         "rotation": int(box.rotation),
+        "line_height": int(box.line_height) if box.line_height is not None else None,
     }
 
 
@@ -150,6 +151,7 @@ def dict_to_box(data: dict[str, Any]) -> OCRBox:
         manual=bool(data.get("manual", False)),
         edited=bool(data.get("edited", False)),
         rotation=int(data.get("rotation", 0)),
+        line_height=(int(data["line_height"]) if data.get("line_height") is not None else None),
     )
 
 

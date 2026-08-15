@@ -58,6 +58,7 @@ class BoxPayload(BaseModel):
     manual: bool = False
     edited: bool = True
     rotation: int = 0
+    line_height: int | None = None
 
 
 class SlidePayload(BaseModel):
@@ -159,6 +160,7 @@ def update_slide(job_id: str, slide_index: int, payload: SlidePayload) -> dict[s
                 manual=bool(item.manual),
                 edited=bool(item.edited),
                 rotation=int(item.rotation),
+                line_height=item.line_height,
             )
         )
     if payload.remove_watermark is not None:

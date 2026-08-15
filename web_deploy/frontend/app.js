@@ -101,6 +101,7 @@ function normalizeBox(box) {
     manual: Boolean(box.manual),
     edited: Boolean(box.edited),
     rotation: Number(box.rotation || 0),
+    line_height: box.line_height == null ? null : Number(box.line_height),
   };
 }
 
@@ -466,6 +467,7 @@ $("addBoxBtn").addEventListener("click", () => {
     manual: true,
     edited: true,
     rotation: 0,
+    line_height: null,
   });
   state.selectedIndex = slide.boxes.length - 1;
   updateInspector();

@@ -14,6 +14,7 @@ import importlib.util
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import median
 from typing import Callable
 
 BASE = Path(__file__).resolve().parent.parent
@@ -93,7 +94,7 @@ SKIP_TEXTS = {"NotebookLM"}
 ProgressCB = Callable[[str], None] | None
 PROGRESS_PREFIX = "__PPTTOEDIT_PROGRESS__|"
 PAGE_READY_PREFIX = "__PPTTOEDIT_PAGE_READY__|"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_PPT_WIDTH = Inches(13.333333)
 OCR_BACKEND_LOCAL = "local"
 OCR_BACKEND_REMOTE = "remote"
@@ -203,6 +204,7 @@ class OCRBox:
     manual: bool = False
     edited: bool = False
     rotation: int = 0
+    line_height: int | None = None
 
     def set_erase_rect(self, rect: tuple[int, int, int, int]):
         left, top, right, bottom = rect
@@ -288,6 +290,15 @@ def _rect_from_data(value, fallback: tuple[int, int, int, int]) -> tuple[int, in
         return fallback
 
 
+def _optional_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def save_project_cache(project: PPTProject, cache_path: Path | None = None, progress: ProgressCB = None) -> Path:
     data = {
         "version": CACHE_VERSION,
@@ -312,6 +323,7 @@ def save_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                         "manual": bool(box.manual),
                         "edited": bool(box.edited),
                         "rotation": int(box.rotation),
+                        "line_height": int(box.line_height) if box.line_height is not None else None,
                     }
                     for box in slide.boxes
                 ],
@@ -344,6 +356,9 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
         data = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         _log(progress, f"识别框缓存读取失败，已忽略：{cache_path} ({exc})")
+        return False
+    if _optional_int(data.get("version")) != CACHE_VERSION:
+        _log(progress, f"识别框缓存版本不匹配，已忽略：{cache_path}")
         return False
     cached_slides = data.get("slides")
     if not isinstance(cached_slides, list) or len(cached_slides) != len(project.slides):
@@ -378,6 +393,7 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                     manual=bool(item.get("manual", False)),
                     edited=bool(item.get("edited", False)),
                     rotation=int(item.get("rotation", 0)),
+                    line_height=_optional_int(item.get("line_height")),
                 )
             )
 
@@ -615,6 +631,123 @@ def _predict_remote_ocr_page(client, image_path: Path) -> dict:
     return _result_as_page_dict(pages[0])
 
 
+def _is_horizontal_ocr_box(box: OCRBox) -> bool:
+    if box.rotation in {90, 270, -90}:
+        return False
+    x, y, width, height = box.bbox
+    return not (height > width * 1.45 and len(box.text.strip()) > 1)
+
+
+def _horizontal_gap(first: OCRBox, second: OCRBox) -> int:
+    first_left, _first_top, first_width, _first_height = first.bbox
+    second_left, _second_top, second_width, _second_height = second.bbox
+    first_right = first_left + first_width
+    second_right = second_left + second_width
+    if first_right < second_left:
+        return second_left - first_right
+    if second_right < first_left:
+        return first_left - second_right
+    return 0
+
+
+def _can_join_ocr_lines(first: OCRBox, second: OCRBox) -> bool:
+    if not _is_horizontal_ocr_box(first) or not _is_horizontal_ocr_box(second):
+        return False
+
+    first_x, first_y, first_width, first_height = first.bbox
+    second_x, second_y, second_width, second_height = second.bbox
+    first_height_ref = first.line_height or first_height
+    second_height_ref = second.line_height or second_height
+    min_height = min(first_height_ref, second_height_ref)
+    max_height = max(first_height_ref, second_height_ref)
+    if min_height <= 0 or max_height / min_height > 1.35:
+        return False
+
+    vertical_gap = second_y - (first_y + first_height)
+    if vertical_gap < -0.25 * min_height or vertical_gap > max(8, 0.9 * max_height):
+        return False
+
+    first_center = first_x + first_width / 2
+    second_center = second_x + second_width / 2
+    first_right = first_x + first_width
+    second_right = second_x + second_width
+    alignment_delta = min(
+        abs(first_x - second_x),
+        abs(first_center - second_center),
+        abs(first_right - second_right),
+    )
+    if alignment_delta > 0.75 * max_height:
+        return False
+    return _horizontal_gap(first, second) <= 1.5 * max_height
+
+
+def _ocr_line_join_score(first: OCRBox, second: OCRBox) -> float:
+    if not _can_join_ocr_lines(first, second):
+        return float("inf")
+    first_x, first_y, first_width, first_height = first.bbox
+    second_x, second_y, second_width, _second_height = second.bbox
+    first_height_ref = first.line_height or first_height
+    second_height_ref = second.line_height or second.bbox[3]
+    first_center = first_x + first_width / 2
+    second_center = second_x + second_width / 2
+    first_right = first_x + first_width
+    second_right = second_x + second_width
+    alignment_delta = min(
+        abs(first_x - second_x),
+        abs(first_center - second_center),
+        abs(first_right - second_right),
+    )
+    vertical_gap = second_y - (first_y + first_height)
+    return abs(vertical_gap) + alignment_delta + abs(first_height_ref - second_height_ref)
+
+
+def _merge_ocr_line_group(group: list[OCRBox]) -> OCRBox:
+    if len(group) == 1:
+        return group[0]
+
+    left = min(box.bbox[0] for box in group)
+    top = min(box.bbox[1] for box in group)
+    right = max(box.bbox[0] + box.bbox[2] for box in group)
+    bottom = max(box.bbox[1] + box.bbox[3] for box in group)
+    erase_left = min(box.erase_rect[0] for box in group)
+    erase_top = min(box.erase_rect[1] for box in group)
+    erase_right = max(box.erase_rect[2] for box in group)
+    erase_bottom = max(box.erase_rect[3] for box in group)
+    line_heights = [box.line_height or box.bbox[3] for box in group]
+    return OCRBox(
+        text="\n".join(box.text for box in group),
+        score=sum(box.score for box in group) / len(group),
+        bbox=(left, top, right - left, bottom - top),
+        erase_rect=(erase_left, erase_top, erase_right, erase_bottom),
+        enabled=all(box.enabled for box in group),
+        manual=any(box.manual for box in group),
+        edited=any(box.edited for box in group),
+        line_height=int(round(median(line_heights))),
+    )
+
+
+def group_ocr_boxes(boxes: list[OCRBox]) -> list[OCRBox]:
+    candidates = [
+        box
+        for box in boxes
+        if box.text.strip() and box.text.strip() not in SKIP_TEXTS
+    ]
+    candidates.sort(key=lambda box: (box.bbox[1], box.bbox[0]))
+    groups: list[list[OCRBox]] = []
+    for box in candidates:
+        joinable = [
+            (index, _ocr_line_join_score(group[-1], box))
+            for index, group in enumerate(groups)
+            if _can_join_ocr_lines(group[-1], box)
+        ]
+        if joinable:
+            group_index, _score = min(joinable, key=lambda item: item[1])
+            groups[group_index].append(box)
+        else:
+            groups.append([box])
+    return [_merge_ocr_line_group(group) for group in groups]
+
+
 def run_ocr(
     slides: list[PPTSlide],
     progress: ProgressCB = None,
@@ -682,11 +815,12 @@ def run_ocr(
                     score=float(score),
                     bbox=(x, y, w, h),
                     erase_rect=erase_rect,
+                    line_height=h,
                 )
             )
-        slide.boxes = boxes
+        slide.boxes = group_ocr_boxes(boxes)
         _page_ready(progress, slide)
-        _log(progress, f"第 {slide.index} 页 OCR 完成，共 {len(boxes)} 个框")
+        _log(progress, f"第 {slide.index} 页 OCR 完成，共 {len(slide.boxes)} 个框")
     if use_remote and hasattr(ocr, "close"):
         ocr.close()
 
@@ -988,6 +1122,8 @@ def sample_text_color(image: Image.Image, rect):
 def should_rotate_text(box: OCRBox) -> bool:
     if box.rotation in {90, 270, -90}:
         return True
+    if "\n" in box.text:
+        return False
     x, y, w, h = box.bbox
     return h > w * 1.45 and len(box.text.strip()) > 1
 
@@ -1004,7 +1140,6 @@ def add_textbox(slide, color_image, box: OCRBox, x_scale: float, y_scale: float)
     height = int(h * y_scale)
     rotate_text = should_rotate_text(box)
     font_axis = height
-
     if rotate_text:
         center_x = left + width / 2
         center_y = top + height / 2
@@ -1015,6 +1150,7 @@ def add_textbox(slide, color_image, box: OCRBox, x_scale: float, y_scale: float)
         font_axis = width
     else:
         shape = slide.shapes.add_textbox(left, top, width, height)
+        font_axis = box.line_height * y_scale if box.line_height is not None else height
     shape.fill.background()
     shape.line.fill.background()
 
@@ -1031,7 +1167,6 @@ def add_textbox(slide, color_image, box: OCRBox, x_scale: float, y_scale: float)
     p.alignment = PP_ALIGN.LEFT
     run = p.add_run()
     run.text = text
-    run.font.name = "Microsoft YaHei"
     run.font.bold = True
     run.font.size = Pt(max(8, font_axis * 0.72 / 12700))
     run.font.color.rgb = sample_text_color(color_image, box.erase_rect)

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import sys
 import traceback
+import os
+import threading
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 BASE = Path(__file__).resolve().parent.parent
 for deps_name in [".py310gui", ".py310iopaint", ".py310deps"]:
@@ -11,7 +16,7 @@ for deps_name in [".py310gui", ".py310iopaint", ".py310deps"]:
         sys.path.insert(0, str(deps))
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,11 +36,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QToolBar,
@@ -59,13 +67,27 @@ from .core import (
     PAGE_READY_PREFIX,
     PROGRESS_PREFIX,
     REMOTE_OCR_TOKEN_LENGTH,
+    VisualAsset,
+    detect_visual_assets,
+    store_visual_asset_mask,
+    visual_asset_from_data,
+    visual_asset_to_data,
 )
 from .ocr_config import resolve_ocr_config
+from .sam_segmentation import (
+    MODEL_FILENAME,
+    MODEL_ID,
+    SamSegmentationEngine,
+    download_model,
+    model_path,
+    preferred_device,
+    verify_model,
+)
 
 FLOW_TEXT = (
     "1. 打开 PPT/PDF --> 2. 选择 OCR 方式并识别 --> "
-    "3. 检查识别框 --> 4. IOPaint 擦除 --> "
-    "5. 选择是否清晰化 --> 6. 导出可编辑 PPT"
+    "3. 检查识别框 --> 4. 图片拆分 --> 5. IOPaint 擦除 --> "
+    "6. 选择是否清晰化 --> 7. 导出可编辑 PPT"
 )
 
 BoxSnapshot = list[
@@ -79,6 +101,9 @@ BoxSnapshot = list[
         bool,
         int,
         int | None,
+        tuple[tuple[tuple[int, int], ...], ...],
+        str,
+        str | None,
     ]
 ]
 
@@ -157,6 +182,10 @@ class EditableRectItem(QGraphicsRectItem):
             color = QColor(150, 150, 150, 190)
         elif self.isSelected():
             color = QColor(255, 140, 0, 220)
+        elif self.box.mask_mode == "rectangle_fallback" or not self.box.text_regions:
+            color = QColor(220, 70, 70, 220)
+        elif self.box.text_regions:
+            color = QColor(40, 180, 100, 220)
         else:
             color = QColor(0, 170, 255, 200)
         self.setPen(QPen(color, 2))
@@ -166,9 +195,13 @@ class EditableRectItem(QGraphicsRectItem):
         s = self.HANDLE_SIZE
         return {
             "tl": QRectF(r.left() - s / 2, r.top() - s / 2, s, s),
+            "t": QRectF(r.center().x() - s / 2, r.top() - s / 2, s, s),
             "tr": QRectF(r.right() - s / 2, r.top() - s / 2, s, s),
+            "r": QRectF(r.right() - s / 2, r.center().y() - s / 2, s, s),
             "bl": QRectF(r.left() - s / 2, r.bottom() - s / 2, s, s),
+            "b": QRectF(r.center().x() - s / 2, r.bottom() - s / 2, s, s),
             "br": QRectF(r.right() - s / 2, r.bottom() - s / 2, s, s),
+            "l": QRectF(r.left() - s / 2, r.center().y() - s / 2, s, s),
         }
 
     def _handle_at(self, pos):
@@ -183,6 +216,10 @@ class EditableRectItem(QGraphicsRectItem):
             self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         elif handle in {"tr", "bl"}:
             self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in {"l", "r"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif handle in {"t", "b"}:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
         else:
             self.setCursor(Qt.CursorShape.SizeAllCursor if self.isSelected() else Qt.CursorShape.ArrowCursor)
         super().hoverMoveEvent(event)
@@ -245,10 +282,163 @@ class EditableRectItem(QGraphicsRectItem):
         if record_undo and new_rect != self._press_erase_rect:
             self.changed_cb(self, before_change=True)
         self.box.set_erase_rect(new_rect)
+        self.box.text_regions = ()
+        self.box.mask_mode = "pending"
+        self.box.mask_reason = "擦除框已手动调整"
         if self.box.manual:
             self.box.set_bbox_from_rect(new_rect)
             left, top, right, bottom = self.box.erase_rect
             self.box.rotation = 270 if (bottom - top) > (right - left) * 1.45 else 0
+        self._update_pen()
+        self.changed_cb(self, before_change=False)
+
+
+class EditableAssetItem(QGraphicsRectItem):
+    HANDLE_SIZE = 10.0
+
+    def __init__(self, asset: VisualAsset, changed_cb):
+        x, y, width, height = asset.bbox
+        super().__init__(0, 0, width, height)
+        self.asset = asset
+        self.changed_cb = changed_cb
+        self.setPos(x, y)
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setAcceptHoverEvents(True)
+        self._active_handle = None
+        self._press_scene_pos = QPointF()
+        self._press_rect = QRectF()
+        self._press_pos = QPointF()
+        self._press_bbox = asset.bbox
+        self._update_pen()
+
+    def _update_pen(self):
+        if self.isSelected():
+            color = QColor(255, 140, 0, 230)
+        elif self.asset.confirmed:
+            color = QColor(91, 33, 182, 230)
+        else:
+            color = QColor(124, 58, 237, 220)
+        self.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+        self.setBrush(QColor(color.red(), color.green(), color.blue(), 18))
+
+    def paint(self, painter: QPainter, option, widget=None):
+        super().paint(painter, option, widget)
+        rect = self.rect()
+        marker_size = min(18.0, max(10.0, min(rect.width(), rect.height()) - 2.0))
+        marker_rect = QRectF(
+            rect.right() - marker_size - 1.0,
+            rect.top() + 1.0,
+            marker_size,
+            marker_size,
+        )
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(91, 33, 182, 235))
+        painter.drawRoundedRect(marker_rect, 3.0, 3.0)
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(max(8, int(marker_size * 0.7)))
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255, 245))
+        painter.drawText(marker_rect, Qt.AlignmentFlag.AlignCenter, "P")
+        painter.restore()
+
+    def _handles(self):
+        rect, size = self.rect(), self.HANDLE_SIZE
+        return {
+            "tl": QRectF(rect.left() - size / 2, rect.top() - size / 2, size, size),
+            "t": QRectF(rect.center().x() - size / 2, rect.top() - size / 2, size, size),
+            "tr": QRectF(rect.right() - size / 2, rect.top() - size / 2, size, size),
+            "r": QRectF(rect.right() - size / 2, rect.center().y() - size / 2, size, size),
+            "bl": QRectF(rect.left() - size / 2, rect.bottom() - size / 2, size, size),
+            "b": QRectF(rect.center().x() - size / 2, rect.bottom() - size / 2, size, size),
+            "br": QRectF(rect.right() - size / 2, rect.bottom() - size / 2, size, size),
+            "l": QRectF(rect.left() - size / 2, rect.center().y() - size / 2, size, size),
+        }
+
+    def _handle_at(self, pos):
+        return next((name for name, rect in self._handles().items() if rect.contains(pos)), None)
+
+    def shape(self):
+        path = super().shape()
+        for handle_rect in self._handles().values():
+            path.addRect(handle_rect)
+        return path
+
+    def hoverMoveEvent(self, event):
+        handle = self._handle_at(event.pos())
+        if handle in {"tl", "br"}:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif handle in {"tr", "bl"}:
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in {"l", "r"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif handle in {"t", "b"}:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor if self.isSelected() else Qt.CursorShape.ArrowCursor)
+        super().hoverMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._active_handle = self._handle_at(event.pos())
+        self._press_scene_pos = event.scenePos()
+        self._press_rect = QRectF(self.rect())
+        self._press_pos = QPointF(self.pos())
+        self._press_bbox = self.asset.bbox
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._active_handle:
+            super().mouseMoveEvent(event)
+            return
+        delta = event.scenePos() - self._press_scene_pos
+        left, top = self._press_pos.x(), self._press_pos.y()
+        right = left + self._press_rect.width()
+        bottom = top + self._press_rect.height()
+        minimum = 12.0
+        if "l" in self._active_handle:
+            left = min(left + delta.x(), right - minimum)
+        if "r" in self._active_handle:
+            right = max(right + delta.x(), left + minimum)
+        if "t" in self._active_handle:
+            top = min(top + delta.y(), bottom - minimum)
+        if "b" in self._active_handle:
+            bottom = max(bottom + delta.y(), top + minimum)
+        bounds = self.scene().sceneRect() if self.scene() else QRectF()
+        if not bounds.isNull():
+            left, top = max(bounds.left(), left), max(bounds.top(), top)
+            right, bottom = min(bounds.right(), right), min(bounds.bottom(), bottom)
+        self.setPos(left, top)
+        self.setRect(0, 0, max(minimum, right - left), max(minimum, bottom - top))
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._active_handle = None
+        self.sync_to_asset(record_undo=True)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._update_pen()
+        return super().itemChange(change, value)
+
+    def sync_to_asset(self, record_undo=False):
+        rect = self.mapRectToScene(self.rect())
+        bbox = (round(rect.left()), round(rect.top()), max(1, round(rect.width())), max(1, round(rect.height())))
+        if record_undo and bbox != self._press_bbox:
+            self.changed_cb(self, before_change=True)
+        self.asset.bbox = bbox
+        self.asset.confirmed = False
+        self.asset.status = "candidate"
+        self.asset.segmentation_mode = "opencv"
+        self.asset.confidence = None
+        self.asset.model_id = None
+        self.asset.image_path = None
+        self.asset.mask_path = None
         self._update_pen()
         self.changed_cb(self, before_change=False)
 
@@ -283,7 +473,8 @@ class ManualDialog(QDialog):
 2. 点击“打开 PPT”，导入图片型 PPT。
 3. 程序会提取每页图片；请先在右侧选择本地或远端 OCR，再点击“开始 OCR（按当前选择）”识别文字区域。
 4. OCR 完成后，在中间画布检查蓝色文字框，必要时调整、删除或新增框。
-5. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。""",
+5. 如需把页面底图中的插图拆成独立图片，在右侧“图片拆分（AI 可选）”中调整候选框并确认图片。
+6. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。""",
         ),
         (
             "PDF 导入",
@@ -320,6 +511,29 @@ PDF 载入完成后，源 PDF 会自动加入右侧“PPT 列表”并打开。�
 
 拖拽/缩放：
 选中框后可以拖动位置，也可以拖动四角调整大小。竖向文字可以用窄高框框住，输入正常横向文本后导出为旋转文本。""",
+        ),
+        (
+            "图片拆分",
+            """功能用途：
+“图片拆分”用于把已经合成在 PPT 页面底图中的插图识别出来，导出后作为可以单独移动、缩放的 PPT 图片。它不是 OCR，也不是把任意人物照片自动处理成商业级透明素材；边缘效果取决于原图质量和候选框范围。
+
+开始操作：
+打开 PPT 或 PDF 并载入页面后，右侧会显示“图片拆分（AI 可选）”。点击“识别此页图片”后，程序会自动检测当前页的图片区候选，并在画布上显示紫色虚线框。颜色更深的紫色表示已确认图片，浅紫色表示尚未确认的候选；橙色框表示当前选中项。OCR 文字框使用其他颜色显示。
+
+调整候选框：
+先点击目标候选框。拖动框内区域可以移动位置；拖动四个角或上下左右边中间的控制点可以调整大小。候选框应覆盖完整插图，尽量不要包含旁边的图片、表格或大块背景。误检时点击“删除候选”；漏检时点击“添加图片区”，再手动移动和缩放新候选框。
+
+AI 精细分割：
+候选框调整好后，点击“AI 精细分割”。第一次使用需要下载约 156 MB 的 SAM 2.1 Tiny 模型，按提示选择保存目录并等待下载完成；模型准备好后不需要重启。程序会优先使用 CUDA，无法使用时尝试 CPU。分割成功后候选框会变成绿色，并记录 SAM 蒙版。
+
+OpenCV 蒙版：
+如果不想下载模型，或 AI 分割失败，可以点击“恢复 OpenCV 蒙版”。这会使用较快的本地颜色蒙版确认候选，适合边缘简单、颜色对比明显的插图；复杂边缘、相邻图片或背景颜色接近时，效果通常不如 SAM。
+
+确认与导出：
+只有深紫色的已确认候选才会参与导出，浅紫色的未确认候选会被忽略。点击“导出可编辑 PPT”后，程序会把已确认插图保存为透明 PNG，并作为独立图片重新放回 PPT；原底图中的对应区域会同时参与擦除和修复。图片上的文字如果已经被 OCR 识别，默认会保留文字在图片上方的层级，并尝试修复图片中的文字区域。
+
+重新检测注意事项：
+点击“识别此页图片”会根据当前页面重新生成候选框，可能替换当前页面已有的手动候选和调整结果。已经手动调好的候选不要随意重复识别；需要重新识别时，建议先确认页面内容再重新调整候选框。""",
         ),
         (
             "右侧功能",
@@ -442,6 +656,7 @@ class MainWindow(QMainWindow):
     MAX_UNDO_STEPS = 50
     SETTINGS_ORG = "PPTtoEdit"
     SETTINGS_APP = "PPTEditableOCR"
+    SAM_MODEL_DIRECTORY_KEY = "sam/model_directory"
 
     def __init__(self):
         super().__init__()
@@ -450,9 +665,11 @@ class MainWindow(QMainWindow):
         self.project: PPTProject | None = None
         self.current_slide: PPTSlide | None = None
         self.current_items: list[EditableRectItem] = []
+        self.current_asset_items: list[EditableAssetItem] = []
         self.worker_thread: QThread | None = None
         self.worker: Worker | None = None
         self.selected_item: EditableRectItem | None = None
+        self.selected_asset_item: EditableAssetItem | None = None
         self.undo_stacks: dict[int, list[BoxSnapshot]] = {}
         self.pending_select_index: int | None = None
         self.ppt_paths: list[Path] = []
@@ -463,6 +680,11 @@ class MainWindow(QMainWindow):
         self.ocr_backend: str = OCR_BACKEND_LOCAL
         self.ocr_token: str | None = None
         self.pending_ocr_error: tuple[str, object | None] | None = None
+        self.sam_engine: SamSegmentationEngine | None = None
+        self.pending_sam_asset: VisualAsset | None = None
+        self.sam_download_cancel: threading.Event | None = None
+        self.sam_download_dialog: QProgressDialog | None = None
+        self.sam_download_destination: Path | None = None
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
 
         self._build_ui()
@@ -525,6 +747,7 @@ class MainWindow(QMainWindow):
 
         side = QWidget()
         side_layout = QVBoxLayout(side)
+        side_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         ppt_group = QGroupBox("PPT 列表")
         ppt_group_layout = QVBoxLayout(ppt_group)
@@ -559,6 +782,44 @@ class MainWindow(QMainWindow):
         self.ocr_token_status.setWordWrap(True)
         ocr_layout.addRow(self.ocr_token_status)
         side_layout.addWidget(ocr_group)
+
+        self.asset_group = QGroupBox("图片拆分（AI 可选）")
+        asset_layout = QVBoxLayout(self.asset_group)
+        self.sam_status = QLabel()
+        self.sam_status.setWordWrap(True)
+        asset_layout.addWidget(self.sam_status)
+        self.redetect_assets_btn = QPushButton("识别此页图片")
+        self.redetect_assets_btn.setToolTip("自动识别当前页的图片区，并用紫色候选框标出")
+        self.redetect_assets_btn.clicked.connect(self.redetect_visual_assets)
+        asset_layout.addWidget(self.redetect_assets_btn)
+        asset_row = QWidget()
+        asset_row_layout = QHBoxLayout(asset_row)
+        asset_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.add_asset_btn = QPushButton("添加图片区")
+        self.add_asset_btn.clicked.connect(self.add_visual_asset)
+        self.delete_asset_btn = QPushButton("删除候选")
+        self.delete_asset_btn.clicked.connect(self.delete_selected_asset)
+        asset_row_layout.addWidget(self.add_asset_btn)
+        asset_row_layout.addWidget(self.delete_asset_btn)
+        asset_layout.addWidget(asset_row)
+        self.segment_asset_btn = QPushButton("AI 精细分割")
+        self.segment_asset_btn.clicked.connect(self.segment_selected_asset)
+        asset_layout.addWidget(self.segment_asset_btn)
+        self.restore_asset_btn = QPushButton("恢复 OpenCV 蒙版")
+        self.restore_asset_btn.clicked.connect(self.restore_selected_asset_opencv)
+        asset_layout.addWidget(self.restore_asset_btn)
+        model_row = QWidget()
+        model_row_layout = QHBoxLayout(model_row)
+        model_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.redownload_model_btn = QPushButton("下载 / 重新下载模型")
+        self.redownload_model_btn.clicked.connect(lambda: self.request_model_download(force=True))
+        self.open_model_dir_btn = QPushButton("打开模型目录")
+        self.open_model_dir_btn.clicked.connect(self.open_sam_model_dir)
+        model_row_layout.addWidget(self.redownload_model_btn)
+        model_row_layout.addWidget(self.open_model_dir_btn)
+        asset_layout.addWidget(model_row)
+        side_layout.addWidget(self.asset_group)
+        self.update_sam_status()
 
         form = QFormLayout()
         self.pad_x = QSpinBox()
@@ -621,8 +882,14 @@ class MainWindow(QMainWindow):
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMinimumHeight(120)
         side_layout.addWidget(self.log, 1)
-        root.addWidget(side)
+
+        self.side_scroll = QScrollArea()
+        self.side_scroll.setWidgetResizable(True)
+        self.side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.side_scroll.setWidget(side)
+        root.addWidget(self.side_scroll)
         root.setStretchFactor(1, 1)
 
     def set_flow_text(self):
@@ -731,6 +998,12 @@ class MainWindow(QMainWindow):
         self.reset_box_btn.setEnabled(not busy)
         self.delete_box_btn.setEnabled(not busy)
         self.add_box_btn.setEnabled(not busy)
+        for button in (
+            self.redetect_assets_btn, self.add_asset_btn, self.delete_asset_btn,
+            self.segment_asset_btn, self.restore_asset_btn, self.redownload_model_btn,
+            self.open_model_dir_btn,
+        ):
+            button.setEnabled(not busy)
         self.watermark_cb.setEnabled(not busy)
         self.text_edit.setEnabled(not busy)
         self.start_ocr_btn.setEnabled((not busy) and self.project is not None)
@@ -749,12 +1022,12 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.worker_thread)
         self.worker.progress.connect(self.append_log)
         self.worker.finished.connect(finished_cb)
+        self.worker.finished.connect(self.cleanup_worker)
+        self.worker.failed.connect(lambda _msg, _exc: self.cleanup_worker())
         if failed_cb is None:
             self.worker.failed.connect(lambda msg, _exc: self.on_worker_failed(msg))
         else:
             self.worker.failed.connect(failed_cb)
-        self.worker.finished.connect(self.cleanup_worker)
-        self.worker.failed.connect(lambda _msg, _exc: self.cleanup_worker())
         self.worker_thread.started.connect(self.worker.run)
         self.set_busy(True)
         self.worker_thread.start()
@@ -867,7 +1140,9 @@ class MainWindow(QMainWindow):
         self.project = None
         self.current_slide = None
         self.selected_item = None
+        self.selected_asset_item = None
         self.current_items.clear()
+        getattr(self, "current_asset_items", []).clear()
         self.undo_stacks.clear()
         self.pending_select_index = None
         self.slide_list.clear()
@@ -1158,6 +1433,7 @@ class MainWindow(QMainWindow):
             return
         self.scene.clear()
         self.current_items.clear()
+        self.current_asset_items.clear()
         pixmap = QPixmap(str(slide.image_path))
         pixmap_item = QGraphicsPixmapItem(pixmap)
         pixmap_item.setZValue(-10)
@@ -1169,6 +1445,23 @@ class MainWindow(QMainWindow):
         page_border.setPen(border_pen)
         page_border.setZValue(5)
         self.scene.addItem(page_border)
+        for asset in slide.visual_assets:
+            if not asset.enabled:
+                continue
+            x, y, _width, _height = asset.bbox
+            if asset.confirmed and asset.image_path and asset.image_path.is_file():
+                preview = QGraphicsPixmapItem(QPixmap(str(asset.image_path)))
+                preview.setPos(x, y)
+                preview.setOpacity(0.55)
+                preview.setZValue(6)
+                self.scene.addItem(preview)
+            asset_item = EditableAssetItem(asset, self.on_asset_item_changed)
+            asset_item.setToolTip(
+                f"图片区候选：{asset.status}\n分割：{asset.segmentation_mode}\n层级：{'图片在上' if asset.layer == 'above_text' else '文字在上'}"
+            )
+            asset_item.setZValue(7)
+            self.scene.addItem(asset_item)
+            self.current_asset_items.append(asset_item)
         for box in slide.boxes:
             item = EditableRectItem(box, self.on_item_changed)
             item.setZValue(10)
@@ -1201,9 +1494,15 @@ class MainWindow(QMainWindow):
                 box.edited,
                 box.rotation,
                 box.line_height,
+                box.text_regions,
+                box.mask_mode,
+                box.mask_reason,
             )
             for box in slide.boxes
         ]
+
+    def snapshot_assets(self, slide: PPTSlide) -> list[dict]:
+        return [visual_asset_to_data(asset) for asset in slide.visual_assets]
 
     def restore_boxes(self, slide: PPTSlide, snapshot: BoxSnapshot):
         slide.boxes = [
@@ -1217,8 +1516,11 @@ class MainWindow(QMainWindow):
                 edited=edited,
                 rotation=rotation,
                 line_height=line_height,
+                text_regions=text_regions,
+                mask_mode=mask_mode,
+                mask_reason=mask_reason,
             )
-            for text, score, bbox, erase_rect, enabled, manual, edited, rotation, line_height in snapshot
+            for text, score, bbox, erase_rect, enabled, manual, edited, rotation, line_height, text_regions, mask_mode, mask_reason in snapshot
         ]
 
     def push_undo_state(self):
@@ -1228,7 +1530,7 @@ class MainWindow(QMainWindow):
         if key is None:
             return
         stack = self.undo_stacks.setdefault(key, [])
-        stack.append(self.snapshot_boxes(self.current_slide))
+        stack.append((self.snapshot_boxes(self.current_slide), self.snapshot_assets(self.current_slide)))
         if len(stack) > self.MAX_UNDO_STEPS:
             del stack[0]
         self.update_undo_action()
@@ -1263,7 +1565,12 @@ class MainWindow(QMainWindow):
         if self.selected_item and self.selected_item.box in self.current_slide.boxes:
             selected_index = self.current_slide.boxes.index(self.selected_item.box)
         snapshot = stack.pop()
-        self.restore_boxes(self.current_slide, snapshot)
+        if isinstance(snapshot, tuple) and len(snapshot) == 2:
+            box_snapshot, asset_snapshot = snapshot
+            self.restore_boxes(self.current_slide, box_snapshot)
+            self.current_slide.visual_assets = [visual_asset_from_data(item) for item in asset_snapshot]
+        else:
+            self.restore_boxes(self.current_slide, snapshot)
         self.pending_select_index = selected_index
         self.update_slide_list_item(self.current_slide)
         self.render_current_slide()
@@ -1273,9 +1580,28 @@ class MainWindow(QMainWindow):
             self.push_undo_state()
         self.on_scene_selection_changed()
 
+    def on_asset_item_changed(self, _item: EditableAssetItem, before_change: bool = False):
+        if before_change:
+            self.push_undo_state()
+        self.on_scene_selection_changed()
+
     def on_scene_selection_changed(self):
-        items = [item for item in self.scene.selectedItems() if isinstance(item, EditableRectItem)]
+        selected = self.scene.selectedItems()
+        items = [item for item in selected if isinstance(item, EditableRectItem)]
+        asset_items = [item for item in selected if isinstance(item, EditableAssetItem)]
         self.selected_item = items[0] if items else None
+        self.selected_asset_item = asset_items[0] if asset_items else None
+        if self.selected_asset_item:
+            asset = self.selected_asset_item.asset
+            confidence = "--" if asset.confidence is None else f"{asset.confidence:.3f}"
+            self.selected_info.setText(
+                f"图片区：{asset.asset_id}\n范围：{asset.bbox}\n状态：{asset.status}\n"
+                f"分割：{asset.segmentation_mode}\n置信度：{confidence}"
+            )
+            self.text_edit.blockSignals(True)
+            self.text_edit.clear()
+            self.text_edit.blockSignals(False)
+            return
         if not self.selected_item:
             self.selected_info.setText("未选择任何框")
             self.text_edit.blockSignals(True)
@@ -1287,7 +1613,9 @@ class MainWindow(QMainWindow):
             f"文本：{box.text}\n"
             f"置信度：{box.score:.3f}\n"
             f"原始 bbox：{box.bbox}\n"
-            f"擦除框：{box.erase_rect}"
+            f"擦除框：{box.erase_rect}\n"
+            f"擦除模式：{'精细文字蒙版' if box.mask_mode == 'text_stroke' or box.text_regions else '矩形回退'}"
+            + (f"\n原因：{box.mask_reason or '缺少 OCR 文字轮廓'}" if box.mask_reason or not box.text_regions else "")
         )
         self.text_edit.blockSignals(True)
         self.text_edit.setText(box.text)
@@ -1341,6 +1669,221 @@ class MainWindow(QMainWindow):
         self.pending_select_index = len(self.current_slide.boxes) - 1
         self.update_slide_list_item(self.current_slide)
         self.render_current_slide()
+
+    def update_sam_status(self):
+        path = self.current_sam_model_path()
+        if verify_model(path):
+            device = preferred_device().upper()
+            self.sam_status.setText(f"{MODEL_ID}：已就绪（无需重启）\n推理设备：{device}\n{path}")
+        else:
+            self.sam_status.setText(
+                f"{MODEL_ID}：未下载（首次使用约 156 MB）\n"
+                f"当前目录：{path.parent}\n"
+                "点击“下载 / 重新下载模型”选择目录并开始下载。"
+            )
+
+    def current_sam_model_path(self) -> Path:
+        configured = str(self.settings.value(self.SAM_MODEL_DIRECTORY_KEY, "") or "").strip()
+        return Path(configured) / MODEL_FILENAME if configured else model_path()
+
+    def open_sam_model_dir(self):
+        directory = self.current_sam_model_path().parent
+        directory.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(directory))
+
+    def request_model_download(self, force: bool = False):
+        destination = self.current_sam_model_path()
+        if not force and verify_model(destination):
+            self.on_sam_model_ready(destination)
+            return
+        selected_directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择 SAM 2.1 模型保存目录",
+            str(destination.parent),
+        )
+        if not selected_directory:
+            self.pending_sam_asset = None
+            return
+        destination = Path(selected_directory) / MODEL_FILENAME
+        answer = QMessageBox.question(
+            self,
+            "下载 SAM 2.1 模型",
+            f"AI 精细分割需要下载约 156 MB 的 {MODEL_ID} 模型。\n\n保存位置：\n{destination}\n\n是否开始下载？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.pending_sam_asset = None
+            return
+        previous_path = self.current_sam_model_path()
+        self.settings.setValue(self.SAM_MODEL_DIRECTORY_KEY, str(destination.parent))
+        self.sam_download_destination = destination
+        if previous_path != destination:
+            self.sam_engine = None
+        self.update_sam_status()
+        if force and destination.exists():
+            destination.unlink()
+        self.sam_download_cancel = threading.Event()
+        self.sam_download_dialog = QProgressDialog("正在下载 SAM 2.1 模型...", "取消", 0, 0, self)
+        self.sam_download_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.sam_download_dialog.canceled.connect(self.sam_download_cancel.set)
+        self.sam_download_dialog.show()
+        self.run_worker(
+            self._download_sam_model,
+            self.on_sam_model_ready,
+            failed_cb=self.on_sam_download_failed,
+        )
+
+    def _download_sam_model(self, progress=None):
+        def report(done: int, total: int):
+            if progress:
+                percent = int(done * 100 / total) if total else 0
+                progress(f"SAM 2.1 模型下载：{percent}% ({done // 1048576} MB)")
+
+        cancelled = self.sam_download_cancel.is_set if self.sam_download_cancel else None
+        destination = self.sam_download_destination or self.current_sam_model_path()
+        return download_model(destination=destination, progress=report, cancelled=cancelled)
+
+    def on_sam_model_ready(self, _path):
+        if self.sam_download_dialog:
+            self.sam_download_dialog.close()
+        self.sam_download_dialog = None
+        self.sam_download_cancel = None
+        self.sam_download_destination = None
+        self.update_sam_status()
+        self.append_log("SAM 2.1 模型已就绪，无需重启，可直接使用")
+        pending = self.pending_sam_asset
+        self.pending_sam_asset = None
+        if pending and self.current_slide and pending in self.current_slide.visual_assets:
+            self._start_asset_segmentation(pending)
+
+    def on_sam_download_failed(self, message: str, exc):
+        if self.sam_download_dialog:
+            self.sam_download_dialog.close()
+        self.sam_download_dialog = None
+        self.sam_download_cancel = None
+        self.sam_download_destination = None
+        self.pending_sam_asset = None
+        self.append_log(message)
+        self.update_sam_status()
+        if "取消" not in str(exc):
+            QMessageBox.warning(self, "模型下载失败", str(exc))
+
+    def redetect_visual_assets(self):
+        if not self.current_slide:
+            return
+        self.push_undo_state()
+        with Image.open(self.current_slide.image_path) as source:
+            image = np.asarray(source.convert("RGB"))
+        self.current_slide.visual_assets = detect_visual_assets(image, self.current_slide)
+        self.append_log(f"第 {self.current_slide.index} 页已识别出 {len(self.current_slide.visual_assets)} 个图片区候选")
+        self.render_current_slide()
+
+    def add_visual_asset(self):
+        if not self.current_slide:
+            return
+        self.push_undo_state()
+        width = min(360, max(40, self.current_slide.image_width // 3))
+        height = min(260, max(40, self.current_slide.image_height // 3))
+        left = max(0, (self.current_slide.image_width - width) // 2)
+        top = max(0, (self.current_slide.image_height - height) // 2)
+        asset = VisualAsset(
+            asset_id=f"slide-{self.current_slide.index}-visual-{len(self.current_slide.visual_assets) + 1}",
+            bbox=(left, top, width, height),
+            source="manual",
+        )
+        self.current_slide.visual_assets.append(asset)
+        self.render_current_slide()
+
+    def delete_selected_asset(self):
+        if not self.current_slide or not self.selected_asset_item:
+            return
+        self.push_undo_state()
+        self.current_slide.visual_assets.remove(self.selected_asset_item.asset)
+        self.render_current_slide()
+
+    def restore_selected_asset_opencv(self):
+        if not self.selected_asset_item:
+            return
+        self.push_undo_state()
+        asset = self.selected_asset_item.asset
+        asset.segmentation_mode = "opencv"
+        asset.confidence = None
+        asset.model_id = None
+        asset.mask_version = 0
+        asset.image_path = None
+        asset.mask_path = None
+        asset.confirmed = True
+        asset.status = "confirmed"
+        self.render_current_slide()
+
+    def segment_selected_asset(self):
+        if not self.current_slide or not self.selected_asset_item:
+            QMessageBox.information(self, "提示", "请先选择一个紫色图片区候选框。")
+            return
+        asset = self.selected_asset_item.asset
+        if not verify_model(self.current_sam_model_path()):
+            self.pending_sam_asset = asset
+            self.request_model_download()
+            return
+        self._start_asset_segmentation(asset)
+
+    def _start_asset_segmentation(self, asset: VisualAsset):
+        if not self.current_slide or not self.project:
+            return
+        self.push_undo_state()
+        asset.status = "segmenting"
+        slide = self.current_slide
+        project = self.project
+        self.render_current_slide()
+        self.run_worker(
+            self._run_asset_segmentation,
+            self.on_asset_segmented,
+            project,
+            slide,
+            asset,
+            failed_cb=lambda message, exc: self.on_asset_segmentation_failed(asset, message, exc),
+        )
+
+    def _run_asset_segmentation(self, project, slide, asset, progress=None):
+        if progress:
+            progress(f"第 {slide.index} 页正在执行 SAM 2.1 精细分割...")
+        with Image.open(slide.image_path) as source:
+            image = np.asarray(source.convert("RGB"))
+        if self.sam_engine is None:
+            self.sam_engine = SamSegmentationEngine(self.current_sam_model_path(), device="auto")
+        x, y, width, height = asset.bbox
+        result = self.sam_engine.segment_with_box(
+            image,
+            (x, y, x + width, y + height),
+            image_key=str(slide.image_path),
+        )
+        store_visual_asset_mask(project, slide, asset, result)
+        return asset
+
+    def on_asset_segmented(self, asset):
+        self.append_log(
+            f"AI 精细分割完成：{asset.asset_id}，置信度 {asset.confidence:.3f}，设备 {self.sam_engine.device}"
+        )
+        self.save_current_cache(show_message=False, log_success=False)
+        self.render_current_slide()
+
+    def on_asset_segmentation_failed(self, asset, message: str, exc):
+        asset.status = "fallback"
+        asset.segmentation_mode = "opencv"
+        asset.confirmed = True
+        asset.confidence = None
+        asset.model_id = None
+        self.append_log(message)
+        self.render_current_slide()
+        if isinstance(exc, (ImportError, ModuleNotFoundError)):
+            detail = (
+                "SAM 2.1 运行组件未完整加载。请重新安装或修复程序依赖，"
+                "然后重启本程序再试。"
+            )
+        else:
+            detail = str(exc)
+        QMessageBox.warning(self, "AI 分割失败", f"已回退 OpenCV 蒙版，可继续导出。\n\n{detail}")
 
     def on_text_edited(self):
         if not self.selected_item:

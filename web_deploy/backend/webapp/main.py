@@ -8,9 +8,9 @@ from typing import Any
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.core import OCRBox
+from app.core import OCRBox, VisualAsset
 
 from .storage import (
     box_to_dict,
@@ -59,12 +59,34 @@ class BoxPayload(BaseModel):
     edited: bool = True
     rotation: int = 0
     line_height: int | None = None
+    text_regions: list[list[list[int]]] = Field(default_factory=list)
+    mask_mode: str = "pending"
+    mask_reason: str | None = None
+
+
+class VisualAssetPayload(BaseModel):
+    asset_id: str
+    bbox: list[int]
+    enabled: bool = True
+    source: str = "opencv"
+    status: str = "rule_candidate"
+    layer: str = "below_text"
 
 
 class SlidePayload(BaseModel):
     boxes: list[BoxPayload]
     remove_watermark: bool | None = None
     watermark_rect: list[int] | None = None
+    visual_assets: list[VisualAssetPayload] | None = None
+
+
+def text_regions_from_payload(regions: list[list[list[int]]]) -> tuple[tuple[tuple[int, int], ...], ...]:
+    parsed = []
+    for region in regions:
+        points = tuple((int(point[0]), int(point[1])) for point in region if len(point) >= 2)
+        if len(points) >= 3:
+            parsed.append(points)
+    return tuple(parsed)
 
 
 @app.exception_handler(InvalidJobId)
@@ -122,6 +144,11 @@ def get_slides(job_id: str) -> dict[str, Any]:
                 "imageHeight": slide.image_height,
                 "imageUrl": f"/api/jobs/{job_id}/slides/{slide.index}/image",
                 "boxes": [box_to_dict(box) for box in slide.boxes],
+                "visualAssets": [
+                    {"assetId": asset.asset_id, "bbox": list(asset.bbox), "enabled": asset.enabled,
+                     "source": asset.source, "status": asset.status, "layer": asset.layer}
+                    for asset in slide.visual_assets
+                ],
                 "watermarkRect": list(slide.watermark_rect) if slide.watermark_rect else None,
                 "removeWatermark": slide.remove_watermark,
             }
@@ -161,12 +188,27 @@ def update_slide(job_id: str, slide_index: int, payload: SlidePayload) -> dict[s
                 edited=bool(item.edited),
                 rotation=int(item.rotation),
                 line_height=item.line_height,
+                text_regions=text_regions_from_payload(item.text_regions),
+                mask_mode=str(item.mask_mode or "pending"),
+                mask_reason=item.mask_reason,
             )
         )
     if payload.remove_watermark is not None:
         slide.remove_watermark = payload.remove_watermark
     if payload.watermark_rect is not None:
         slide.watermark_rect = tuple(int(value) for value in payload.watermark_rect)  # type: ignore[assignment]
+    if payload.visual_assets is not None:
+        slide.visual_assets = [
+            VisualAsset(
+                asset_id=item.asset_id,
+                bbox=tuple(int(value) for value in item.bbox),  # type: ignore[arg-type]
+                enabled=item.enabled,
+                source=item.source,
+                status=item.status,
+                layer=item.layer,
+            )
+            for item in payload.visual_assets
+        ]
 
     save_project(job_id, project)
     state = read_json(state_path(job_id), {})
@@ -177,7 +219,7 @@ def update_slide(job_id: str, slide_index: int, payload: SlidePayload) -> dict[s
     if state.get("status") != "done":
         changes.update(status="ready", phase="可检查识别框并导出")
     update_state(job_id, **changes)
-    return {"ok": True, "boxCount": len(slide.boxes)}
+    return {"ok": True, "boxCount": len(slide.boxes), "visualAssetCount": len(slide.visual_assets)}
 
 
 @app.post("/jobs/{job_id}/export")

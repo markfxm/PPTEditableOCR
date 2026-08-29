@@ -12,7 +12,7 @@ pathex = [
     str(project_root / ".py310iopaint"),
 ]
 
-datas = []
+datas = [(str(project_root / "THIRD_PARTY_NOTICES.md"), ".")]
 binaries = []
 hiddenimports = []
 
@@ -84,6 +84,10 @@ packages = [
     "iopaint",
     "torch",
     "torchvision",
+    "sam2",
+    "hydra",
+    "omegaconf",
+    "iopath",
     "transformers",
     "huggingface_hub",
     "safetensors",

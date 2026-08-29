@@ -231,6 +231,8 @@ class OcrParagraphCacheTest(unittest.TestCase):
                     bbox=(20, 100, 100, 50),
                     erase_rect=(18, 98, 122, 152),
                     line_height=20,
+                    text_regions=(((20, 100), (120, 100), (120, 120), (20, 120)),),
+                    mask_mode="text_stroke",
                 )
             ],
             ocr_status="ok",
@@ -269,6 +271,8 @@ class OcrParagraphCacheTest(unittest.TestCase):
             restored.slides[0].boxes = []
             self.assertTrue(load_project_cache(restored, cache_path=cache))
             self.assertEqual(restored.slides[0].boxes[0].line_height, 20)
+            self.assertEqual(restored.slides[0].boxes[0].mask_mode, "text_stroke")
+            self.assertEqual(len(restored.slides[0].boxes[0].text_regions), 1)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,7 @@ async function loadSlides() {
     ...slide,
     imageUrl: `${apiBase}${slide.imageUrl.replace(/^\/api/, "")}`,
     boxes: slide.boxes.map(normalizeBox),
+    visualAssets: (slide.visualAssets || []).map(normalizeVisualAsset),
   }));
   renderSlideList();
   if (!state.currentSlide && state.slides.length) await selectSlide(state.slides[0].index);
@@ -102,6 +103,20 @@ function normalizeBox(box) {
     edited: Boolean(box.edited),
     rotation: Number(box.rotation || 0),
     line_height: box.line_height == null ? null : Number(box.line_height),
+    text_regions: Array.isArray(box.text_regions) ? box.text_regions.map((region) => region.map((point) => point.map(Number))) : [],
+    mask_mode: box.mask_mode || "pending",
+    mask_reason: box.mask_reason || null,
+  };
+}
+
+function normalizeVisualAsset(asset) {
+  return {
+    asset_id: asset.assetId || asset.asset_id || "visual-asset",
+    bbox: (asset.bbox || [0, 0, 1, 1]).map(Number),
+    enabled: asset.enabled !== false,
+    source: asset.source || "opencv",
+    status: asset.status || "rule_candidate",
+    layer: asset.layer || "below_text",
   };
 }
 
@@ -224,11 +239,23 @@ function draw() {
   canvas.style.display = hasPreview ? "block" : "none";
   if (!hasPreview) return;
   ctx.drawImage(state.image, 0, 0, canvas.width, canvas.height);
+  (state.currentSlide.visualAssets || []).forEach((asset) => {
+    if (!asset.enabled) return;
+    const [x, y, w, h] = rectToCanvas(asset.bbox);
+    ctx.save();
+    ctx.setLineDash([7, 4]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = asset.status === "rule_candidate" ? "#7c3aed" : "#a855f7";
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = "rgba(124, 58, 237, 0.04)";
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+  });
   state.currentSlide.boxes.forEach((box, index) => {
     const [x, y, w, h] = rectToCanvas(box.bbox);
     ctx.save();
     ctx.lineWidth = index === state.selectedIndex ? 3 : 2;
-    ctx.strokeStyle = box.enabled ? (index === state.selectedIndex ? "#dc2626" : "#0f766e") : "#94a3b8";
+    ctx.strokeStyle = box.enabled ? (index === state.selectedIndex ? "#dc2626" : box.mask_mode === "rectangle_fallback" || !box.text_regions.length ? "#dc2626" : "#16a34a") : "#94a3b8";
     ctx.fillStyle = index === state.selectedIndex ? "rgba(220, 38, 38, 0.08)" : "rgba(15, 118, 110, 0.06)";
     ctx.fillRect(x, y, w, h);
     ctx.strokeRect(x, y, w, h);
@@ -293,6 +320,9 @@ function clampBox(box) {
   y = Math.max(0, Math.min(y, slide.imageHeight - h));
   box.bbox = [Math.round(x), Math.round(y), Math.round(w), Math.round(h)];
   box.erase_rect = [box.bbox[0], box.bbox[1], box.bbox[0] + box.bbox[2], box.bbox[1] + box.bbox[3]];
+  box.text_regions = [];
+  box.mask_mode = "pending";
+  box.mask_reason = "擦除框已手动调整";
   box.edited = true;
 }
 
@@ -313,6 +343,9 @@ function expandedRectFromBbox(box) {
 function repadBox(box) {
   box.erase_rect = expandedRectFromBbox(box);
   box.edited = true;
+  box.text_regions = [];
+  box.mask_mode = "pending";
+  box.mask_reason = "擦除框已手动调整";
 }
 
 canvas.addEventListener("mousedown", (event) => {
@@ -381,7 +414,9 @@ function updateInspector(updateText = true) {
   if (updateText) $("textInput").value = box?.text || "";
   $("watermarkInput").checked = state.currentSlide?.removeWatermark !== false;
   $("rotationInput").value = String(box?.rotation || 0);
-  $("selectionLabel").textContent = hasBox ? `第${state.currentSlide.index}页 - 第${state.selectedIndex + 1}个框` : "未选择任何框";
+  $("selectionLabel").textContent = hasBox
+    ? `第${state.currentSlide.index}页 - 第${state.selectedIndex + 1}个框（${box.mask_mode === "text_stroke" || box.text_regions.length ? "精细文字蒙版" : "矩形回退"}${box.mask_reason || !box.text_regions.length ? `：${box.mask_reason || "缺少 OCR 文字轮廓"}` : ""}）`
+    : "未选择任何框";
   setControlsEnabled(Boolean(state.currentSlide));
 }
 
@@ -397,8 +432,9 @@ async function saveCurrentSlide() {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      boxes: slide.boxes,
-      remove_watermark: slide.removeWatermark,
+    boxes: slide.boxes,
+    visual_assets: slide.visualAssets,
+    remove_watermark: slide.removeWatermark,
       watermark_rect: slide.watermarkRect,
     }),
   });
@@ -468,6 +504,9 @@ $("addBoxBtn").addEventListener("click", () => {
     edited: true,
     rotation: 0,
     line_height: null,
+    text_regions: [],
+    mask_mode: "pending",
+    mask_reason: "手动新增框使用矩形擦除",
   });
   state.selectedIndex = slide.boxes.length - 1;
   updateInspector();

@@ -101,7 +101,7 @@ SKIP_TEXTS = {"NotebookLM"}
 ProgressCB = Callable[[str], None] | None
 PROGRESS_PREFIX = "__PPTTOEDIT_PROGRESS__|"
 PAGE_READY_PREFIX = "__PPTTOEDIT_PAGE_READY__|"
-CACHE_VERSION = 2
+CACHE_VERSION = 5
 DEFAULT_PPT_WIDTH = Inches(13.333333)
 OCR_BACKEND_LOCAL = "local"
 OCR_BACKEND_REMOTE = "remote"
@@ -235,6 +235,9 @@ class OCRBox:
     edited: bool = False
     rotation: int = 0
     line_height: int | None = None
+    text_regions: tuple[tuple[tuple[int, int], ...], ...] = ()
+    mask_mode: str = "pending"
+    mask_reason: str | None = None
 
     def set_erase_rect(self, rect: tuple[int, int, int, int]):
         left, top, right, bottom = rect
@@ -264,6 +267,23 @@ class OCRBox:
 
 
 @dataclass
+class VisualAsset:
+    asset_id: str
+    bbox: tuple[int, int, int, int]
+    enabled: bool = True
+    source: str = "opencv"
+    status: str = "candidate"
+    layer: str = "below_text"
+    image_path: Path | None = None
+    mask_path: Path | None = None
+    segmentation_mode: str = "opencv"
+    confidence: float | None = None
+    confirmed: bool = False
+    model_id: str | None = None
+    mask_version: int = 0
+
+
+@dataclass
 class PPTSlide:
     index: int
     image_name: str
@@ -274,6 +294,7 @@ class PPTSlide:
     watermark_rect: tuple[int, int, int, int] | None = None
     remove_watermark: bool = True
     ocr_status: str = "pending"
+    visual_assets: list[VisualAsset] = field(default_factory=list)
 
     def reset_boxes(self, pad_x: int, pad_y: int):
         for box in self.boxes:
@@ -304,6 +325,7 @@ class PPTProject:
     slides: list[PPTSlide]
     slide_width: int
     slide_height: int
+    assets_dir: Path | None = None
 
 
 def default_cache_path(source_pptx: Path) -> Path:
@@ -343,6 +365,68 @@ def _optional_int(value) -> int | None:
     except (TypeError, ValueError):
         return None
 
+
+def _regions_to_data(regions: tuple[tuple[tuple[int, int], ...], ...]) -> list[list[list[int]]]:
+    return [[[int(x), int(y)] for x, y in region] for region in regions]
+
+
+def _regions_from_data(value) -> tuple[tuple[tuple[int, int], ...], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    regions = []
+    for region in value:
+        if not isinstance(region, (list, tuple)) or len(region) < 3:
+            continue
+        points = []
+        for point in region:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                points = []
+                break
+            try:
+                points.append((int(point[0]), int(point[1])))
+            except (TypeError, ValueError):
+                points = []
+                break
+        if len(points) >= 3:
+            regions.append(tuple(points))
+    return tuple(regions)
+
+
+def visual_asset_to_data(asset: VisualAsset) -> dict:
+    return {
+        "asset_id": asset.asset_id,
+        "bbox": _rect_to_list(asset.bbox),
+        "enabled": bool(asset.enabled),
+        "source": asset.source,
+        "status": asset.status,
+        "layer": asset.layer,
+        "image_path": str(asset.image_path) if asset.image_path else None,
+        "mask_path": str(asset.mask_path) if asset.mask_path else None,
+        "segmentation_mode": asset.segmentation_mode,
+        "confidence": float(asset.confidence) if asset.confidence is not None else None,
+        "confirmed": bool(asset.confirmed),
+        "model_id": asset.model_id,
+        "mask_version": int(asset.mask_version),
+    }
+
+
+def visual_asset_from_data(data: dict) -> VisualAsset:
+    return VisualAsset(
+        asset_id=str(data.get("asset_id") or "visual-asset"),
+        bbox=_rect_from_data(data.get("bbox"), (0, 0, 1, 1)),
+        enabled=bool(data.get("enabled", True)),
+        source=str(data.get("source") or "opencv"),
+        status=str(data.get("status") or "candidate"),
+        layer=str(data.get("layer") or "below_text"),
+        image_path=Path(data["image_path"]) if data.get("image_path") else None,
+        mask_path=Path(data["mask_path"]) if data.get("mask_path") else None,
+        segmentation_mode=str(data.get("segmentation_mode") or "opencv"),
+        confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+        confirmed=bool(data.get("confirmed", False)),
+        model_id=str(data["model_id"]) if data.get("model_id") else None,
+        mask_version=int(data.get("mask_version", 0)),
+    )
+
 def save_project_cache(project: PPTProject, cache_path: Path | None = None, progress: ProgressCB = None) -> Path:
     data = {
         "version": CACHE_VERSION,
@@ -358,6 +442,7 @@ def save_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                 "watermark_rect": _rect_to_list(slide.watermark_rect) if slide.watermark_rect else None,
                 "remove_watermark": bool(slide.remove_watermark),
                 "ocr_status": slide.ocr_status,
+                "visual_assets": [visual_asset_to_data(asset) for asset in slide.visual_assets],
                 "boxes": [
                     {
                         "text": box.text,
@@ -369,6 +454,9 @@ def save_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                         "edited": bool(box.edited),
                         "rotation": int(box.rotation),
                         "line_height": int(box.line_height) if box.line_height is not None else None,
+                        "text_regions": _regions_to_data(box.text_regions),
+                        "mask_mode": box.mask_mode,
+                        "mask_reason": box.mask_reason,
                     }
                     for box in slide.boxes
                 ],
@@ -402,7 +490,7 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
     except (OSError, json.JSONDecodeError) as exc:
         _log(progress, f"识别框缓存读取失败，已忽略：{cache_path} ({exc})")
         return False
-    if _optional_int(data.get("version")) != CACHE_VERSION:
+    if _optional_int(data.get("version")) not in {2, 3, 4, CACHE_VERSION}:
         _log(progress, f"识别框缓存版本不匹配，已忽略：{cache_path}")
         return False
     cached_slides = data.get("slides")
@@ -437,6 +525,11 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
             max(cached_watermark_rect[3], default_rect[3]),
         )
         slide.boxes = []
+        slide.visual_assets = [
+            visual_asset_from_data(asset)
+            for asset in cached.get("visual_assets", [])
+            if isinstance(asset, dict)
+        ]
         for item in cached.get("boxes", []):
             if not isinstance(item, dict):
                 continue
@@ -453,6 +546,9 @@ def load_project_cache(project: PPTProject, cache_path: Path | None = None, prog
                     edited=bool(item.get("edited", False)),
                     rotation=int(item.get("rotation", 0)),
                     line_height=_optional_int(item.get("line_height")),
+                    text_regions=_regions_from_data(item.get("text_regions")),
+                    mask_mode=str(item.get("mask_mode") or "pending"),
+                    mask_reason=str(item["mask_reason"]) if item.get("mask_reason") else None,
                 )
             )
 
@@ -466,6 +562,11 @@ def box_to_rect(poly) -> tuple[int, int, int, int]:
     pts = np.array(poly, dtype=np.int32)
     x, y, w, h = cv2.boundingRect(pts)
     return x, y, w, h
+
+
+def normalize_text_region(poly) -> tuple[tuple[int, int], ...]:
+    points = np.asarray(poly, dtype=np.int32).reshape(-1, 2)
+    return tuple((int(x), int(y)) for x, y in points)
 
 
 def default_expand_rect(
@@ -505,6 +606,9 @@ def ocr_box_to_data(box: OCRBox) -> dict:
         "edited": bool(box.edited),
         "rotation": int(box.rotation),
         "line_height": int(box.line_height) if box.line_height is not None else None,
+        "text_regions": _regions_to_data(box.text_regions),
+        "mask_mode": box.mask_mode,
+        "mask_reason": box.mask_reason,
     }
 
 
@@ -521,6 +625,9 @@ def ocr_box_from_data(data: dict) -> OCRBox:
         edited=bool(data.get("edited", False)),
         rotation=int(data.get("rotation", 0)),
         line_height=_optional_int(data.get("line_height")),
+        text_regions=_regions_from_data(data.get("text_regions")),
+        mask_mode=str(data.get("mask_mode") or "pending"),
+        mask_reason=str(data["mask_reason"]) if data.get("mask_reason") else None,
     )
 
 
@@ -531,6 +638,7 @@ def ppt_project_to_data(project: PPTProject) -> dict:
         "images_dir": str(project.images_dir),
         "masks_dir": str(project.masks_dir),
         "cleaned_dir": str(project.cleaned_dir),
+        "assets_dir": str(project.assets_dir) if project.assets_dir else None,
         "slide_width": int(project.slide_width),
         "slide_height": int(project.slide_height),
         "slides": [
@@ -543,6 +651,7 @@ def ppt_project_to_data(project: PPTProject) -> dict:
                 "watermark_rect": _rect_to_list(slide.watermark_rect) if slide.watermark_rect else None,
                 "remove_watermark": bool(slide.remove_watermark),
                 "ocr_status": slide.ocr_status,
+                "visual_assets": [visual_asset_to_data(asset) for asset in slide.visual_assets],
                 "boxes": [ocr_box_to_data(box) for box in slide.boxes],
             }
             for slide in project.slides
@@ -566,6 +675,11 @@ def ppt_project_from_data(data: dict) -> PPTProject:
                 else None,
                 remove_watermark=bool(item.get("remove_watermark", True)),
                 ocr_status=str(item.get("ocr_status") or "pending"),
+                visual_assets=[
+                    visual_asset_from_data(asset)
+                    for asset in item.get("visual_assets", [])
+                    if isinstance(asset, dict)
+                ],
             )
         )
     return PPTProject(
@@ -574,6 +688,7 @@ def ppt_project_from_data(data: dict) -> PPTProject:
         images_dir=Path(data["images_dir"]),
         masks_dir=Path(data["masks_dir"]),
         cleaned_dir=Path(data["cleaned_dir"]),
+        assets_dir=Path(data["assets_dir"]) if data.get("assets_dir") else None,
         slides=slides,
         slide_width=int(data["slide_width"]),
         slide_height=int(data["slide_height"]),
@@ -672,6 +787,7 @@ def _merge_ocr_line_group(group: list[OCRBox]) -> OCRBox:
         manual=any(box.manual for box in group),
         edited=any(box.edited for box in group),
         line_height=int(round(median(line_heights))),
+        text_regions=tuple(region for box in group for region in box.text_regions),
     )
 
 
@@ -714,6 +830,7 @@ def build_ocr_boxes(page: dict, slide: PPTSlide) -> list[OCRBox]:
                 bbox=(x, y, w, h),
                 erase_rect=erase_rect,
                 line_height=h,
+                text_regions=(normalize_text_region(poly),),
             )
         )
     return group_ocr_boxes(boxes)
@@ -928,7 +1045,6 @@ def prepare_pdf_project(
         run_ocr(slides, progress, ocr_backend=ocr_backend, ocr_token=ocr_token)
     _log(progress, "PDF 已载入工作区，未生成中间 PPT")
     return project
-
 
 def _make_remote_ocr_options(OCROptions):
     if OCROptions is None:
@@ -1258,6 +1374,7 @@ def prepare_project(
     images_dir = work_dir / "images"
     masks_dir = work_dir / "masks"
     cleaned_dir = work_dir / "cleaned"
+    assets_dir = work_dir / "assets"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     src, slides = extract_slide_images(source_pptx, images_dir, progress)
@@ -1267,25 +1384,330 @@ def prepare_project(
         images_dir=images_dir,
         masks_dir=masks_dir,
         cleaned_dir=cleaned_dir,
+        assets_dir=assets_dir,
         slides=slides,
         slide_width=src.slide_width,
         slide_height=src.slide_height,
     )
     if not load_project_cache(project, progress=progress) and auto_ocr:
         run_ocr(slides, progress, ocr_backend=ocr_backend, ocr_token=ocr_token)
+    for slide in project.slides:
+        if slide.visual_assets or not slide.image_path.exists():
+            continue
+        with Image.open(slide.image_path) as source_image:
+            slide.visual_assets = detect_visual_assets(np.asarray(source_image.convert("RGB")), slide)
+        if slide.visual_assets:
+            _log(progress, f"第 {slide.index} 页发现 {len(slide.visual_assets)} 个图片区候选")
     return project
+
+def _rect_mask(image_width: int, image_height: int, rect: tuple[int, int, int, int]) -> np.ndarray:
+    mask = np.zeros((image_height, image_width), dtype=np.uint8)
+    left, top, right, bottom = rect
+    cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
+    return mask
+
+
+def text_region_mask(image_shape: tuple[int, ...], boxes: list[OCRBox]) -> np.ndarray:
+    """Return the real OCR glyph polygons, falling back only for legacy boxes."""
+    height, width = image_shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for box in boxes:
+        if not box.enabled:
+            continue
+        if box.text_regions:
+            for region in box.text_regions:
+                cv2.fillPoly(mask, [np.asarray(region, dtype=np.int32)], 255)
+        else:
+            x, y, w, h = box.bbox
+            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+    return mask
+
+
+def _visual_foreground_mask(image: np.ndarray) -> np.ndarray:
+    """Conservative non-background mask used when an optional SAM model is unavailable."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    # Colorful diagrams/photos are reliable candidates. Low-saturation page grids remain background.
+    mask[(saturation >= 35) & (value <= 245)] = 255
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
+
+
+def detect_visual_assets(image: np.ndarray, slide: PPTSlide) -> list[VisualAsset]:
+    """Find conservative visual candidates after excluding actual text polygons."""
+    candidates = _visual_foreground_mask(image)
+    candidates[text_region_mask(image.shape, slide.boxes) > 0] = 0
+    contours, _hierarchy = cv2.findContours(candidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(256, int(image.shape[0] * image.shape[1] * 0.01))
+    max_area = int(image.shape[0] * image.shape[1] * 0.80)
+    assets: list[VisualAsset] = []
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        x, y, width, height = cv2.boundingRect(contour)
+        area = width * height
+        if area < min_area or area > max_area:
+            continue
+        assets.append(
+            VisualAsset(
+                asset_id=f"slide-{slide.index}-visual-{len(assets) + 1}",
+                bbox=(int(x), int(y), int(width), int(height)),
+                source="opencv",
+                status="candidate",
+                layer="below_text",
+            )
+        )
+    return assets
+
+
+def visual_asset_alpha_mask(image: np.ndarray, asset: VisualAsset, boxes: list[OCRBox]) -> np.ndarray:
+    """Return a full-page alpha mask; overlapping text is repaired in the asset pixels later."""
+    height, width = image.shape[:2]
+    x, y, asset_width, asset_height = asset.bbox
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(width, x + asset_width), min(height, y + asset_height)
+    alpha = np.zeros((height, width), dtype=np.uint8)
+    if right <= left or bottom <= top:
+        return alpha
+    if asset.segmentation_mode == "sam2" and asset.mask_path and asset.mask_path.is_file():
+        with Image.open(asset.mask_path) as stored_mask:
+            cropped = np.asarray(stored_mask.convert("L"))
+        expected_shape = (bottom - top, right - left)
+        if cropped.shape == expected_shape:
+            alpha[top:bottom, left:right] = cropped
+        else:
+            asset.status = "fallback"
+    if not np.any(alpha[top:bottom, left:right]):
+        foreground = _visual_foreground_mask(image)
+        alpha[top:bottom, left:right] = foreground[top:bottom, left:right]
+    if not np.any(alpha[top:bottom, left:right]):
+        alpha[top:bottom, left:right] = 255
+    if asset.layer != "above_text":
+        overlap_text = text_region_mask(image.shape, boxes)
+        overlap_text[:top, :] = 0
+        overlap_text[bottom:, :] = 0
+        overlap_text[:, :left] = 0
+        overlap_text[:, right:] = 0
+        alpha[overlap_text > 0] = 255
+    return alpha
+
+
+def build_asset_text_mask(image: np.ndarray, asset: VisualAsset, boxes: list[OCRBox]) -> np.ndarray:
+    """Build an expanded text-stroke mask clipped to one visual asset."""
+    height, width = image.shape[:2]
+    x, y, asset_width, asset_height = asset.bbox
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(width, x + asset_width), min(height, y + asset_height)
+    combined = np.zeros((height, width), dtype=np.uint8)
+    if right <= left or bottom <= top or asset.layer == "above_text":
+        return combined
+
+    for box in boxes:
+        if not box.enabled:
+            continue
+        box_x, box_y, box_width, box_height = box.bbox
+        if box_x + box_width <= left or box_x >= right or box_y + box_height <= top or box_y >= bottom:
+            continue
+        strokes, _mode, _reason = build_text_stroke_mask(image, box)
+        line_height = max(1, int(box.line_height or box_height))
+        radius = max(1, int(round(line_height * 0.09)))
+        kernel_size = radius * 2 + 1
+        expanded = cv2.dilate(
+            strokes,
+            np.ones((kernel_size, kernel_size), dtype=np.uint8),
+            iterations=1,
+        )
+        combined = cv2.bitwise_or(combined, expanded)
+
+    allowed = np.zeros_like(combined)
+    allowed[top:bottom, left:right] = 255
+    return cv2.bitwise_and(combined, allowed)
+
+
+def soft_blend_inpaint(
+    original: np.ndarray,
+    repaired: np.ndarray,
+    mask: np.ndarray,
+    feather_px: int = 24,
+) -> np.ndarray:
+    """Blend repaired pixels through a soft mask while leaving distant pixels untouched."""
+    if original.shape != repaired.shape or original.shape[:2] != mask.shape[:2]:
+        raise ValueError("修复图、原图和蒙版尺寸必须一致。")
+    binary = np.zeros(mask.shape[:2], dtype=np.uint8)
+    binary[np.asarray(mask) > 0] = 255
+    if not np.any(binary):
+        return original.copy()
+    feather_px = max(1, int(feather_px))
+    kernel_size = feather_px * 2 + 1
+    soft = cv2.GaussianBlur(binary, (kernel_size, kernel_size), sigmaX=max(1.0, feather_px / 3))
+    # Keep the interior fully repaired and use the blur only around its boundary.
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    soft[distance >= feather_px] = 255
+    weight = soft.astype(np.float32)[:, :, None] / 255.0
+    blended = repaired.astype(np.float32) * weight + original.astype(np.float32) * (1.0 - weight)
+    return np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
+
+def finish_page_inpaint(original: np.ndarray, generated: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Prefer deterministic texture continuation for large flat regions, then soften all seams."""
+    binary = np.zeros(mask.shape[:2], dtype=np.uint8)
+    binary[np.asarray(mask) > 0] = 255
+    if not np.any(binary):
+        return original.copy()
+    candidate = generated.copy()
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    page_area = max(1, binary.shape[0] * binary.shape[1])
+    ring_kernel = np.ones((15, 15), dtype=np.uint8)
+    for component_index in range(1, count):
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        if area < page_area * 0.02:
+            continue
+        component = np.zeros_like(binary)
+        component[labels == component_index] = 255
+        ring = cv2.subtract(cv2.dilate(component, ring_kernel, iterations=1), component)
+        samples = original[ring > 0]
+        if samples.size == 0 or float(np.mean(np.std(samples.astype(np.float32), axis=0))) >= 18.0:
+            continue
+        texture_fill = cv2.inpaint(original, component, 7, cv2.INPAINT_TELEA)
+        candidate[component > 0] = texture_fill[component > 0]
+
+    masked_width = int(stats[1:, cv2.CC_STAT_WIDTH].max()) if count > 1 else 1
+    masked_height = int(stats[1:, cv2.CC_STAT_HEIGHT].max()) if count > 1 else 1
+    feather = min(40, max(15, int(round(min(masked_width, masked_height) * 0.08))))
+    return soft_blend_inpaint(original, candidate, binary, feather_px=feather)
+
+
+def _clean_segmentation_mask(mask: np.ndarray, asset: VisualAsset, boxes: list[OCRBox]) -> np.ndarray:
+    binary = np.zeros(mask.shape[:2], dtype=np.uint8)
+    binary[np.asarray(mask) > 0] = 255
+    height, width = binary.shape
+    x, y, asset_width, asset_height = asset.bbox
+    margin_x = max(2, int(asset_width * 0.08))
+    margin_y = max(2, int(asset_height * 0.08))
+    allowed = np.zeros_like(binary)
+    left = max(0, x - margin_x)
+    top = max(0, y - margin_y)
+    right = min(width, x + asset_width + margin_x)
+    bottom = min(height, y + asset_height + margin_y)
+    allowed[top:bottom, left:right] = 255
+    binary = cv2.bitwise_and(binary, allowed)
+
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    minimum_area = max(8, int(max(1, asset_width * asset_height) * 0.001))
+    for component in range(1, count):
+        if int(stats[component, cv2.CC_STAT_AREA]) >= minimum_area:
+            cleaned[labels == component] = 255
+    return cv2.GaussianBlur(cleaned, (3, 3), sigmaX=0.6)
+
+
+def store_visual_asset_mask(project: PPTProject, slide: PPTSlide, asset: VisualAsset, result):
+    if result.mask.shape[:2] != (slide.image_height, slide.image_width):
+        raise ValueError("SAM 2.1 蒙版尺寸与幻灯片图片不一致。")
+    with Image.open(slide.image_path) as source_image:
+        image = np.asarray(source_image.convert("RGB"))
+    alpha = _clean_segmentation_mask(result.mask, asset, slide.boxes)
+    if not np.any(alpha):
+        raise RuntimeError("SAM 2.1 未在候选框内找到有效图片区域。")
+    _write_visual_asset(project, slide, asset, image, alpha)
+    asset.segmentation_mode = "sam2"
+    asset.confidence = float(result.confidence)
+    asset.model_id = str(result.model_id)
+    asset.mask_version = 1
+    asset.confirmed = True
+    asset.status = "confirmed"
+
+
+def _write_visual_asset(project: PPTProject, slide: PPTSlide, asset: VisualAsset, image: np.ndarray, alpha: np.ndarray):
+    assets_dir = project.assets_dir or project.work_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    height, width = image.shape[:2]
+    x, y, asset_width, asset_height = asset.bbox
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(width, x + asset_width), min(height, y + asset_height)
+    if right <= left or bottom <= top:
+        return
+    stem = f"{slide.image_path.stem}-{asset.asset_id}"
+    image_path = assets_dir / f"{stem}.png"
+    mask_path = assets_dir / f"{stem}.mask.png"
+    rgba = np.dstack((image[top:bottom, left:right], alpha[top:bottom, left:right]))
+    Image.fromarray(rgba, "RGBA").save(image_path)
+    Image.fromarray(alpha[top:bottom, left:right]).save(mask_path)
+    asset.image_path = image_path
+    asset.mask_path = mask_path
+
+
+def build_text_stroke_mask(image: np.ndarray, box: OCRBox) -> tuple[np.ndarray, str, str | None]:
+    """Return a narrow text-pixel mask, falling back to the legacy rectangle when needed."""
+    image_height, image_width = image.shape[:2]
+    if not box.text_regions:
+        return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "缺少 OCR 文字轮廓"
+
+    allowed = _rect_mask(image_width, image_height, box.erase_rect)
+    regions = np.zeros_like(allowed)
+    for region in box.text_regions:
+        points = np.asarray(region, dtype=np.int32)
+        cv2.fillPoly(regions, [points], 255)
+    allowed = cv2.bitwise_and(allowed, regions)
+    region_pixels = int(np.count_nonzero(allowed))
+    if region_pixels == 0:
+        return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "OCR 文字轮廓无效"
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    # Text strokes have local contrast in either direction. This preserves the approach for
+    # light text on dark fills without assuming a fixed text colour.
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=5, sigmaY=5)
+    contrast = cv2.absdiff(gray, blurred)
+    strokes = np.zeros_like(allowed)
+    strokes[(contrast >= 18) & (allowed > 0)] = 255
+    stroke_pixels = int(np.count_nonzero(strokes))
+    density = stroke_pixels / region_pixels
+    if density < 0.01:
+        return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "未找到足够的文字笔画"
+    if density > 0.60:
+        return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "文字区域线条过密，可能与插图重叠"
+
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(strokes, connectivity=8)
+    large_thin_component = any(
+        int(component[cv2.CC_STAT_AREA]) > max(80, int(region_pixels * 0.01))
+        and (
+            int(component[cv2.CC_STAT_WIDTH]) / max(1, int(component[cv2.CC_STAT_HEIGHT])) <= 0.30
+            or int(component[cv2.CC_STAT_HEIGHT]) / max(1, int(component[cv2.CC_STAT_WIDTH])) <= 0.30
+        )
+        for component in stats[1:]
+    )
+    if large_thin_component:
+        return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "检测到大面积连通线条，可能与插图重叠"
+
+    strokes = cv2.dilate(strokes, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    return strokes, "text_stroke", None
 
 
 def build_masks(project: PPTProject, progress: ProgressCB = None):
     project.masks_dir.mkdir(parents=True, exist_ok=True)
+    (project.assets_dir or project.work_dir / "assets").mkdir(parents=True, exist_ok=True)
     total_slides = max(1, len(project.slides))
     for done, slide in enumerate(project.slides, start=1):
+        with Image.open(slide.image_path) as source_image:
+            image = np.asarray(source_image.convert("RGB"))
         mask = np.zeros((slide.image_height, slide.image_width), dtype=np.uint8)
         for box in slide.boxes:
             if not box.enabled:
                 continue
-            left, top, right, bottom = box.erase_rect
-            cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
+            box_mask, box.mask_mode, box.mask_reason = build_text_stroke_mask(image, box)
+            mask = cv2.bitwise_or(mask, box_mask)
+            if box.mask_reason:
+                _log(progress, f"第 {slide.index} 页文字框已回退矩形擦除：{box.mask_reason}")
+        for asset in slide.visual_assets:
+            if not asset.enabled or not asset.confirmed:
+                continue
+            alpha = visual_asset_alpha_mask(image, asset, slide.boxes)
+            if not np.any(alpha):
+                asset.enabled = False
+                asset.status = "disabled_empty"
+                _log(progress, f"第 {slide.index} 页图片区候选为空，已跳过：{asset.asset_id}")
+                continue
+            _write_visual_asset(project, slide, asset, image, alpha)
+            mask = cv2.bitwise_or(mask, alpha)
         if slide.remove_watermark and slide.watermark_rect:
             left, top, right, bottom = slide.watermark_rect
             cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
@@ -1310,7 +1732,99 @@ def os_environ_with_pythonpath():
     return env
 
 
-def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: ProgressCB = None):
+def repair_visual_assets(
+    project: PPTProject,
+    model,
+    inpaint_request,
+    progress: ProgressCB = None,
+) -> None:
+    """Repair OCR text inside confirmed visual assets without punching alpha holes."""
+    for slide in project.slides:
+        if not slide.image_path.is_file():
+            continue
+        with Image.open(slide.image_path) as source_image:
+            page = np.asarray(source_image.convert("RGB"))
+        page_height, page_width = page.shape[:2]
+        for asset in slide.visual_assets:
+            if not asset.enabled or not asset.confirmed or not asset.image_path or not asset.image_path.is_file():
+                continue
+            text_mask = build_asset_text_mask(page, asset, slide.boxes)
+            if not np.any(text_mask):
+                asset.mask_version = max(asset.mask_version, 2)
+                continue
+
+            x, y, asset_width, asset_height = asset.bbox
+            padding = max(24, int(round(max(asset_width, asset_height) * 0.08)))
+            crop_left = max(0, x - padding)
+            crop_top = max(0, y - padding)
+            crop_right = min(page_width, x + asset_width + padding)
+            crop_bottom = min(page_height, y + asset_height + padding)
+            crop = page[crop_top:crop_bottom, crop_left:crop_right].copy()
+            local_text_mask = text_mask[crop_top:crop_bottom, crop_left:crop_right].copy()
+            model_mask = local_text_mask.copy()
+
+            available = model_mask == 0
+            fill_color = np.median(crop[available], axis=0).astype(np.uint8) if np.any(available) else np.zeros(3, np.uint8)
+            for neighbor in slide.visual_assets:
+                if neighbor is asset or not neighbor.enabled or not neighbor.confirmed:
+                    continue
+                nx, ny, nw, nh = neighbor.bbox
+                left = max(crop_left, nx)
+                top = max(crop_top, ny)
+                right = min(crop_right, nx + nw)
+                bottom = min(crop_bottom, ny + nh)
+                if right <= left or bottom <= top:
+                    continue
+                lx0, ly0 = left - crop_left, top - crop_top
+                lx1, ly1 = right - crop_left, bottom - crop_top
+                neighbor_context = np.zeros_like(model_mask)
+                neighbor_context[ly0:ly1, lx0:lx1] = 255
+                ax0, ay0 = max(0, x - crop_left), max(0, y - crop_top)
+                ax1 = min(neighbor_context.shape[1], x + asset_width - crop_left)
+                ay1 = min(neighbor_context.shape[0], y + asset_height - crop_top)
+                neighbor_context[ay0:ay1, ax0:ax1] = 0
+                crop[neighbor_context > 0] = fill_color
+                model_mask[neighbor_context > 0] = 255
+
+            try:
+                generated = model(crop, model_mask, inpaint_request)
+                generated = cv2.cvtColor(np.asarray(generated), cv2.COLOR_BGR2RGB)
+                line_heights = [
+                    int(box.line_height or box.bbox[3])
+                    for box in slide.boxes
+                    if box.enabled
+                ]
+                feather = min(40, max(15, int(round(median(line_heights))) if line_heights else 15))
+                repaired_crop = soft_blend_inpaint(crop, generated, local_text_mask, feather_px=feather)
+
+                with Image.open(asset.image_path) as stored_asset:
+                    rgba = np.asarray(stored_asset.convert("RGBA")).copy()
+                asset_left = max(0, x) - crop_left
+                asset_top = max(0, y) - crop_top
+                repaired_asset = repaired_crop[
+                    asset_top:asset_top + rgba.shape[0],
+                    asset_left:asset_left + rgba.shape[1],
+                ]
+                if repaired_asset.shape[:2] != rgba.shape[:2]:
+                    raise RuntimeError("局部修复结果与图片资产尺寸不一致。")
+                rgba[:, :, :3] = repaired_asset
+                Image.fromarray(rgba, "RGBA").save(asset.image_path)
+                asset.mask_version = 2
+                if asset.status == "repair_warning":
+                    asset.status = "confirmed"
+                _log(progress, f"第 {slide.index} 页图片内文字已局部修复：{asset.asset_id}")
+            except Exception as exc:
+                asset.status = "repair_warning"
+                _log(progress, f"第 {slide.index} 页图片内文字修复失败，已保留原图：{asset.asset_id} ({exc})")
+
+
+def run_iopaint(
+    images_dir: Path,
+    masks_dir: Path,
+    cleaned_dir: Path,
+    progress: ProgressCB = None,
+    project: PPTProject | None = None,
+):
     if cleaned_dir.exists():
         shutil.rmtree(cleaned_dir)
     cleaned_dir.mkdir(parents=True, exist_ok=True)
@@ -1375,6 +1889,7 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
 
             result = model(image, mask, inpaint_request)
             result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+            result = finish_page_inpaint(image, result, mask)
             output_path = cleaned_dir / f"{stem}.png"
             result_image = Image.fromarray(result)
             output_path.write_bytes(pil_to_bytes(result_image, "png", 100, infos))
@@ -1382,6 +1897,8 @@ def run_iopaint(images_dir: Path, masks_dir: Path, cleaned_dir: Path, progress: 
             torch_gc()
             _log(progress, f"第 {done} 页 IOPaint 擦除后已生成：{compressed_path.name}")
             _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
+        if project is not None:
+            repair_visual_assets(project, model, inpaint_request, progress)
 
     device = preferred_iopaint_device(Device)
     try:
@@ -1698,6 +2215,22 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
         )
         x_scale = out.slide_width / slide_data.image_width
         y_scale = out.slide_height / slide_data.image_height
+
+        def add_visual_asset(asset: VisualAsset):
+            if not asset.enabled or not asset.confirmed or not asset.image_path or not asset.image_path.exists():
+                return
+            x, y, width, height = asset.bbox
+            dst.shapes.add_picture(
+                str(asset.image_path),
+                int(x * x_scale),
+                int(y * y_scale),
+                width=int(width * x_scale),
+                height=int(height * y_scale),
+            )
+
+        for asset in slide_data.visual_assets:
+            if asset.layer != "above_text":
+                add_visual_asset(asset)
         count = 0
         for box in slide_data.boxes:
             if slide_data.remove_watermark and slide_data.watermark_rect:
@@ -1709,6 +2242,9 @@ def rebuild_ppt(project: PPTProject, output_pptx: Path, progress: ProgressCB = N
                     continue
             if add_textbox(dst, color_image, box, x_scale, y_scale):
                 count += 1
+        for asset in slide_data.visual_assets:
+            if asset.layer == "above_text":
+                add_visual_asset(asset)
         _log(progress, f"第 {slide_data.index} 页已重建 {count} 个可编辑文本框")
         _progress(progress, int(done * 100 / total_slides), f"重建可编辑文本框：{done}/{total_slides}")
     output_pptx.parent.mkdir(parents=True, exist_ok=True)
@@ -1724,7 +2260,7 @@ def export_editable_ppt(
     enhance_images: bool = True,
 ):
     build_masks(project, progress)
-    run_iopaint(project.images_dir, project.masks_dir, project.cleaned_dir, progress)
+    run_iopaint(project.images_dir, project.masks_dir, project.cleaned_dir, progress, project=project)
     if enhance_images:
         upscale_cleaned_images(project.cleaned_dir, progress=progress)
     else:

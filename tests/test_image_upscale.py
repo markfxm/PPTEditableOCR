@@ -15,6 +15,7 @@ from app.core import (
     OCRBox,
     PPTProject,
     PPTSlide,
+    VisualAsset,
     cleaned_image_path,
     export_editable_ppt,
     prefer_system_cuda_torch,
@@ -30,6 +31,12 @@ from app.core import (
     default_watermark_rect,
     build_ocr_boxes,
     build_masks,
+    build_asset_text_mask,
+    build_text_stroke_mask,
+    detect_visual_assets,
+    finish_page_inpaint,
+    visual_asset_alpha_mask,
+    soft_blend_inpaint,
     load_project_cache,
     save_compressed_cleaned_image,
     upscale_cleaned_images,
@@ -37,6 +44,179 @@ from app.core import (
 
 
 class UpscaleCleanedImagesTest(unittest.TestCase):
+    def test_detect_visual_assets_excludes_text_regions(self):
+        image = np.full((100, 160, 3), 250, dtype=np.uint8)
+        image[20:80, 100:145] = (0, 180, 220)
+        image[25:45, 15:85] = (0, 0, 120)
+        slide = PPTSlide(
+            index=1,
+            image_name="slide.png",
+            image_path=Path("slide.png"),
+            image_width=160,
+            image_height=100,
+            boxes=[
+                OCRBox(
+                    text="标题",
+                    score=1.0,
+                    bbox=(15, 25, 70, 20),
+                    erase_rect=(10, 20, 90, 50),
+                    text_regions=(((15, 25), (85, 25), (85, 45), (15, 45)),),
+                )
+            ],
+        )
+
+        assets = detect_visual_assets(image, slide)
+
+        self.assertEqual(len(assets), 1)
+        self.assertGreaterEqual(assets[0].bbox[0], 95)
+        self.assertEqual(assets[0].layer, "below_text")
+
+    def test_visual_asset_alpha_keeps_text_area_opaque_for_local_repair(self):
+        image = np.full((80, 100, 3), 255, dtype=np.uint8)
+        image[10:70, 20:90] = (10, 160, 220)
+        image[30:45, 40:60] = (255, 255, 255)
+        asset = VisualAsset(asset_id="asset-1", bbox=(20, 10, 70, 60))
+        box = OCRBox(
+            text="标题",
+            score=1.0,
+            bbox=(40, 30, 20, 15),
+            erase_rect=(40, 30, 60, 45),
+            text_regions=(((40, 30), (60, 30), (60, 45), (40, 45)),),
+        )
+
+        alpha = visual_asset_alpha_mask(image, asset, [box])
+
+        self.assertEqual(alpha[25, 35], 255)
+        self.assertEqual(alpha[5, 30], 0)
+        self.assertEqual(alpha[35, 50], 255)
+
+    def test_asset_text_mask_is_expanded_and_clipped_to_asset(self):
+        image = np.full((80, 100, 3), 255, dtype=np.uint8)
+        cv2 = __import__("cv2")
+        cv2.putText(image, "A", (35, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+        asset = VisualAsset(asset_id="asset-1", bbox=(20, 10, 50, 50))
+        box = OCRBox(
+            text="A",
+            score=1.0,
+            bbox=(30, 20, 30, 30),
+            erase_rect=(25, 15, 65, 55),
+            text_regions=(((30, 20), (60, 20), (60, 50), (30, 50)),),
+            line_height=30,
+        )
+
+        mask = build_asset_text_mask(image, asset, [box])
+
+        self.assertGreater(np.count_nonzero(mask), 30)
+        self.assertEqual(int(np.count_nonzero(mask[:10])), 0)
+        self.assertEqual(int(np.count_nonzero(mask[:, :20])), 0)
+        self.assertEqual(int(np.count_nonzero(mask[:, 70:])), 0)
+
+    def test_soft_blend_inpaint_preserves_unmasked_pixels_and_softens_boundary(self):
+        original = np.zeros((31, 31, 3), dtype=np.uint8)
+        repaired = np.full((31, 31, 3), 200, dtype=np.uint8)
+        mask = np.zeros((31, 31), dtype=np.uint8)
+        mask[8:23, 8:23] = 255
+
+        blended = soft_blend_inpaint(original, repaired, mask, feather_px=6)
+
+        self.assertEqual(tuple(blended[0, 0]), (0, 0, 0))
+        self.assertGreater(int(blended[8, 15, 0]), 0)
+        self.assertLess(int(blended[8, 15, 0]), 200)
+        self.assertEqual(tuple(blended[15, 15]), (200, 200, 200))
+
+    def test_finish_page_inpaint_prefers_surrounding_texture_for_large_flat_region(self):
+        original = np.full((80, 100, 3), (30, 50, 70), dtype=np.uint8)
+        original[:, :, 0] += np.arange(100, dtype=np.uint8)[None, :] // 10
+        generated = np.full_like(original, (220, 20, 20))
+        mask = np.zeros((80, 100), dtype=np.uint8)
+        mask[15:65, 20:80] = 255
+
+        finished = finish_page_inpaint(original, generated, mask)
+
+        self.assertEqual(tuple(finished[0, 0]), tuple(original[0, 0]))
+        self.assertLess(int(finished[40, 50, 0]), 100)
+        self.assertGreater(int(finished[40, 50, 2]), 50)
+        self.assertLess(abs(int(finished[15, 50, 0]) - int(original[15, 50, 0])), 30)
+
+    def test_rebuild_places_visual_asset_between_background_and_text(self):
+        from pptx import Presentation
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images_dir, masks_dir, cleaned_dir, assets_dir = (root / "images", root / "masks", root / "cleaned", root / "assets")
+            for directory in (images_dir, masks_dir, cleaned_dir, assets_dir):
+                directory.mkdir()
+            original_path = images_dir / "slide.png"
+            cleaned_path = cleaned_dir / "slide.png"
+            asset_path = assets_dir / "device.png"
+            Image.new("RGB", (100, 80), "white").save(original_path)
+            Image.new("RGB", (100, 80), "white").save(cleaned_path)
+            Image.new("RGBA", (30, 50), (0, 150, 220, 255)).save(asset_path)
+            project = PPTProject(
+                source_pptx=root / "source.pptx", work_dir=root, images_dir=images_dir,
+                masks_dir=masks_dir, cleaned_dir=cleaned_dir, assets_dir=assets_dir,
+                slide_width=914400, slide_height=914400,
+                slides=[PPTSlide(
+                    index=1, image_name="slide.png", image_path=original_path,
+                    image_width=100, image_height=80,
+                    visual_assets=[VisualAsset("device", (60, 10, 30, 50), image_path=asset_path, confirmed=True)],
+                    boxes=[OCRBox("标题", 1.0, (10, 10, 30, 20), (10, 10, 40, 30))],
+                )],
+            )
+
+            output = root / "out.pptx"
+            rebuild_ppt(project, output)
+
+            self.assertEqual(len(Presentation(output).slides[0].shapes), 3)
+    def test_text_stroke_mask_is_narrow_and_preserves_nearby_illustration(self):
+        image = np.full((100, 160, 3), 255, dtype=np.uint8)
+        cv2 = __import__("cv2")
+        cv2.putText(image, "TEXT", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.line(image, (125, 10), (125, 90), (0, 0, 0), 2)
+        box = OCRBox(
+            text="TEXT",
+            score=1.0,
+            bbox=(5, 20, 95, 40),
+            erase_rect=(0, 0, 150, 99),
+            text_regions=(((5, 20), (105, 20), (105, 60), (5, 60)),),
+        )
+
+        mask, mode, reason = build_text_stroke_mask(image, box)
+
+        self.assertEqual(mode, "text_stroke")
+        self.assertIsNone(reason)
+        self.assertGreater(np.count_nonzero(mask), 100)
+        self.assertLess(np.count_nonzero(mask), 100 * 40)
+        self.assertEqual(mask[50, 125], 0)
+
+    def test_text_stroke_mask_falls_back_for_legacy_box_without_regions(self):
+        image = np.full((40, 40, 3), 255, dtype=np.uint8)
+        box = OCRBox(text="旧框", score=1.0, bbox=(10, 10, 10, 10), erase_rect=(8, 8, 22, 22))
+
+        mask, mode, reason = build_text_stroke_mask(image, box)
+
+        self.assertEqual(mode, "rectangle_fallback")
+        self.assertEqual(reason, "缺少 OCR 文字轮廓")
+        self.assertEqual(mask[8, 8], 255)
+        self.assertEqual(mask[0, 0], 0)
+
+    def test_text_stroke_mask_marks_large_thin_line_as_overlap_risk(self):
+        image = np.full((100, 120, 3), 255, dtype=np.uint8)
+        cv2 = __import__("cv2")
+        cv2.line(image, (80, 10), (80, 90), (0, 0, 0), 3)
+        box = OCRBox(
+            text="疑似文本",
+            score=1.0,
+            bbox=(10, 10, 90, 80),
+            erase_rect=(5, 5, 110, 95),
+            text_regions=(((10, 10), (100, 10), (100, 90), (10, 90)),),
+        )
+
+        _mask, mode, reason = build_text_stroke_mask(image, box)
+
+        self.assertEqual(mode, "rectangle_fallback")
+        self.assertIn("连通线条", reason)
+
     def test_build_ocr_boxes_omits_notebooklm_watermark_text(self):
         slide = PPTSlide(
             index=1,
@@ -58,6 +238,7 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
 
         self.assertEqual([box.text for box in boxes], ["Title"])
         self.assertTrue(boxes[0].enabled)
+        self.assertEqual(boxes[0].text_regions, (((10, 10), (60, 10), (60, 30), (10, 30)),))
 
     def test_prefer_system_cuda_torch_keeps_cuda_module_loaded(self):
         loaded_modules = {}
@@ -912,6 +1093,13 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
                     watermark_rect=(70, 60, 99, 79),
                     remove_watermark=False,
                     ocr_status="ok",
+                    visual_assets=[
+                        VisualAsset(
+                            asset_id="device", bbox=(50, 5, 40, 65),
+                            status="rule_candidate", layer="below_text",
+                            image_path=Path("assets/device.png"),
+                        )
+                    ],
                 )
             ],
             slide_width=914400,
@@ -925,6 +1113,8 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
         self.assertFalse(restored.slides[0].remove_watermark)
         self.assertEqual(restored.slides[0].boxes[0].text, "Hello")
         self.assertEqual(restored.slides[0].boxes[0].rotation, 270)
+        self.assertEqual(restored.slides[0].visual_assets[0].asset_id, "device")
+        self.assertEqual(restored.slides[0].visual_assets[0].image_path, Path("assets/device.png"))
 
     def test_export_subprocess_relays_progress_and_returns_output_path(self):
         class FakeStdout:

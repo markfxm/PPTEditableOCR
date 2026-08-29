@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from app.core import OCRBox, PPTProject, PPTSlide
+from app.core import OCRBox, PPTProject, PPTSlide, VisualAsset
 
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
@@ -110,6 +110,18 @@ def box_to_dict(box: OCRBox) -> dict[str, Any]:
         "edited": bool(box.edited),
         "rotation": int(box.rotation),
         "line_height": int(box.line_height) if box.line_height is not None else None,
+        "text_regions": [[[int(x), int(y)] for x, y in region] for region in box.text_regions],
+        "mask_mode": box.mask_mode,
+        "mask_reason": box.mask_reason,
+    }
+
+
+def visual_asset_to_dict(asset: VisualAsset) -> dict[str, Any]:
+    return {
+        "asset_id": asset.asset_id, "bbox": [int(value) for value in asset.bbox],
+        "enabled": bool(asset.enabled), "source": asset.source, "status": asset.status,
+        "layer": asset.layer, "image_path": str(asset.image_path) if asset.image_path else None,
+        "mask_path": str(asset.mask_path) if asset.mask_path else None,
     }
 
 
@@ -122,6 +134,7 @@ def slide_to_dict(slide: PPTSlide) -> dict[str, Any]:
         "image_height": int(slide.image_height),
         "watermark_rect": list(slide.watermark_rect) if slide.watermark_rect else None,
         "remove_watermark": bool(slide.remove_watermark),
+        "visual_assets": [visual_asset_to_dict(asset) for asset in slide.visual_assets],
         "boxes": [box_to_dict(box) for box in slide.boxes],
     }
 
@@ -133,6 +146,7 @@ def project_to_dict(project: PPTProject) -> dict[str, Any]:
         "images_dir": str(project.images_dir),
         "masks_dir": str(project.masks_dir),
         "cleaned_dir": str(project.cleaned_dir),
+        "assets_dir": str(project.assets_dir) if project.assets_dir else None,
         "slide_width": int(project.slide_width),
         "slide_height": int(project.slide_height),
         "slides": [slide_to_dict(slide) for slide in project.slides],
@@ -152,6 +166,24 @@ def dict_to_box(data: dict[str, Any]) -> OCRBox:
         edited=bool(data.get("edited", False)),
         rotation=int(data.get("rotation", 0)),
         line_height=(int(data["line_height"]) if data.get("line_height") is not None else None),
+        text_regions=tuple(
+            tuple((int(point[0]), int(point[1])) for point in region)
+            for region in data.get("text_regions", [])
+            if isinstance(region, list) and len(region) >= 3
+        ),
+        mask_mode=str(data.get("mask_mode") or "pending"),
+        mask_reason=str(data["mask_reason"]) if data.get("mask_reason") else None,
+    )
+
+
+def dict_to_visual_asset(data: dict[str, Any]) -> VisualAsset:
+    return VisualAsset(
+        asset_id=str(data.get("asset_id") or "visual-asset"),
+        bbox=tuple(int(value) for value in data.get("bbox", [0, 0, 1, 1])),  # type: ignore[arg-type]
+        enabled=bool(data.get("enabled", True)), source=str(data.get("source") or "opencv"),
+        status=str(data.get("status") or "rule_candidate"), layer=str(data.get("layer") or "below_text"),
+        image_path=Path(data["image_path"]) if data.get("image_path") else None,
+        mask_path=Path(data["mask_path"]) if data.get("mask_path") else None,
     )
 
 
@@ -165,6 +197,7 @@ def dict_to_slide(data: dict[str, Any]) -> PPTSlide:
         boxes=[dict_to_box(item) for item in data.get("boxes", [])],
         watermark_rect=tuple(data["watermark_rect"]) if data.get("watermark_rect") else None,  # type: ignore[arg-type]
         remove_watermark=bool(data.get("remove_watermark", True)),
+        visual_assets=[dict_to_visual_asset(item) for item in data.get("visual_assets", []) if isinstance(item, dict)],
     )
 
 
@@ -175,6 +208,7 @@ def dict_to_project(data: dict[str, Any]) -> PPTProject:
         images_dir=Path(data["images_dir"]),
         masks_dir=Path(data["masks_dir"]),
         cleaned_dir=Path(data["cleaned_dir"]),
+        assets_dir=Path(data["assets_dir"]) if data.get("assets_dir") else None,
         slides=[dict_to_slide(item) for item in data.get("slides", [])],
         slide_width=int(data["slide_width"]),
         slide_height=int(data["slide_height"]),

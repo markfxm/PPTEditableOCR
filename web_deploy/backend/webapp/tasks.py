@@ -82,6 +82,7 @@ def export_job(job_id: str) -> None:
         save_project_cache(project, progress=lambda msg: _progress(job_id, msg))
         output = job_dir(job_id) / "outputs" / f"{project.source_pptx.stem}-editable-clean.pptx"
         export_editable_ppt(project, output, progress=lambda msg: _progress(job_id, msg))
+        save_project(job_id, project)
         update_state(job_id, status="done", phase="导出完成", progress=100, outputPptx=str(output))
     except Exception as exc:
         update_state(job_id, status="failed", phase="导出失败", error=str(exc))

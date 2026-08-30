@@ -111,7 +111,7 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(mask[:, :20])), 0)
         self.assertEqual(int(np.count_nonzero(mask[:, 70:])), 0)
 
-    def test_soft_blend_inpaint_preserves_unmasked_pixels_and_softens_boundary(self):
+    def test_soft_blend_inpaint_keeps_mask_interior_repaired_and_feathers_outside(self):
         original = np.zeros((31, 31, 3), dtype=np.uint8)
         repaired = np.full((31, 31, 3), 200, dtype=np.uint8)
         mask = np.zeros((31, 31), dtype=np.uint8)
@@ -120,9 +120,21 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
         blended = soft_blend_inpaint(original, repaired, mask, feather_px=6)
 
         self.assertEqual(tuple(blended[0, 0]), (0, 0, 0))
-        self.assertGreater(int(blended[8, 15, 0]), 0)
-        self.assertLess(int(blended[8, 15, 0]), 200)
+        self.assertEqual(tuple(blended[8, 15]), (200, 200, 200))
+        self.assertGreater(int(blended[7, 15, 0]), 0)
+        self.assertLess(int(blended[7, 15, 0]), 200)
         self.assertEqual(tuple(blended[15, 15]), (200, 200, 200))
+
+    def test_soft_blend_inpaint_does_not_restore_old_text_inside_narrow_mask(self):
+        original = np.full((25, 25, 3), 230, dtype=np.uint8)
+        original[6:19, 11:14] = 20
+        repaired = np.full_like(original, 230)
+        mask = np.zeros((25, 25), dtype=np.uint8)
+        mask[6:19, 11:14] = 255
+
+        blended = soft_blend_inpaint(original, repaired, mask, feather_px=15)
+
+        self.assertTrue(np.all(blended[6:19, 11:14] == 230))
 
     def test_finish_page_inpaint_prefers_surrounding_texture_for_large_flat_region(self):
         original = np.full((80, 100, 3), (30, 50, 70), dtype=np.uint8)
@@ -188,6 +200,36 @@ class UpscaleCleanedImagesTest(unittest.TestCase):
         self.assertGreater(np.count_nonzero(mask), 100)
         self.assertLess(np.count_nonzero(mask), 100 * 40)
         self.assertEqual(mask[50, 125], 0)
+
+    def test_text_stroke_mask_expansion_scales_with_line_height_without_reaching_nearby_art(self):
+        image = np.full((80, 120, 3), 255, dtype=np.uint8)
+        image[20:60, 46:55] = 248
+        image[20:60, 49:52] = 20
+        image[10:70, 75:78] = 20
+        large_box = OCRBox(
+            text="I",
+            score=1.0,
+            bbox=(40, 15, 25, 50),
+            erase_rect=(38, 12, 68, 68),
+            text_regions=(((40, 15), (65, 15), (65, 65), (40, 65)),),
+            line_height=40,
+        )
+        small_box = OCRBox(
+            text="I",
+            score=1.0,
+            bbox=large_box.bbox,
+            erase_rect=large_box.erase_rect,
+            text_regions=large_box.text_regions,
+            line_height=10,
+        )
+
+        small_mask, _small_mode, _small_reason = build_text_stroke_mask(image, small_box)
+        mask, mode, reason = build_text_stroke_mask(image, large_box)
+
+        self.assertEqual(mode, "text_stroke")
+        self.assertIsNone(reason)
+        self.assertGreater(np.count_nonzero(mask), np.count_nonzero(small_mask))
+        self.assertEqual(mask[40, 75], 0)
 
     def test_text_stroke_mask_falls_back_for_legacy_box_without_regions(self):
         image = np.full((40, 40, 3), 255, dtype=np.uint8)

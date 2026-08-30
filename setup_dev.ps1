@@ -13,7 +13,9 @@ Install-Target ".py310deps" @(
     "pillow",
     "pypdfium2",
     "opencv-python-headless",
-    "numpy"
+    "numpy",
+    "pymatting",
+    "openai"
 )
 
 Install-Target ".py310gui" @(

@@ -23,10 +23,24 @@ Downloader = Callable[[str, Path, ProgressCB, CancelCB], None]
 
 @dataclass(frozen=True)
 class SegmentationResult:
-    mask: np.ndarray
-    confidence: float
+    masks: np.ndarray
+    scores: np.ndarray
+    selected_index: int
     device: str
     model_id: str = MODEL_ID
+
+    @property
+    def mask(self) -> np.ndarray:
+        return self.masks[self.selected_index]
+
+    @property
+    def confidence(self) -> float:
+        return float(self.scores[self.selected_index])
+
+    def select(self, index: int) -> "SegmentationResult":
+        if index < 0 or index >= len(self.masks):
+            raise IndexError("SAM 候选蒙版索引超出范围。")
+        return SegmentationResult(self.masks, self.scores, int(index), self.device, self.model_id)
 
 
 def model_path(local_appdata: Path | None = None) -> Path:
@@ -147,32 +161,42 @@ class SamSegmentationEngine:
         self,
         image: np.ndarray,
         box: tuple[int, int, int, int],
+        point_coords: list[tuple[float, float]] | np.ndarray | None = None,
+        point_labels: list[int] | np.ndarray | None = None,
         image_key: object | None = None,
     ) -> SegmentationResult:
+        coords = None if point_coords is None else np.asarray(point_coords, dtype=np.float32).reshape(-1, 2)
+        labels = None if point_labels is None else np.asarray(point_labels, dtype=np.int32).reshape(-1)
+        if (coords is None) != (labels is None) or (coords is not None and len(coords) != len(labels)):
+            raise ValueError("SAM 提示点坐标和标签必须一一对应。")
         key = image_key if image_key is not None else id(image)
         try:
-            return self._segment(image, box, key)
+            return self._segment(image, box, coords, labels, key)
         except Exception:
             if self.device != "cuda":
                 raise
             self._load("cpu")
-            return self._segment(image, box, key)
+            return self._segment(image, box, coords, labels, key)
 
-    def _segment(self, image: np.ndarray, box: tuple[int, int, int, int], image_key: object):
+    def _segment(self, image, box, point_coords, point_labels, image_key):
         self._set_image(image, image_key)
         masks, scores, _logits = self.predictor.predict(
             box=np.asarray(box, dtype=np.float32),
+            point_coords=point_coords,
+            point_labels=point_labels,
             multimask_output=True,
         )
         scores = np.asarray(scores).reshape(-1)
         masks = np.asarray(masks)
         if masks.ndim != 3 or not len(scores):
             raise RuntimeError("SAM 2.1 未返回有效蒙版。")
-        best = int(np.argmax(scores))
-        mask = (masks[best] > 0).astype(np.uint8) * 255
+        if len(masks) != len(scores):
+            raise RuntimeError("SAM 2.1 候选蒙版与评分数量不一致。")
+        binary_masks = (masks > 0).astype(np.uint8) * 255
         return SegmentationResult(
-            mask=mask,
-            confidence=float(scores[best]),
+            masks=binary_masks,
+            scores=scores.astype(np.float64),
+            selected_index=int(np.argmax(scores)),
             device=self.device,
         )
 
@@ -182,5 +206,12 @@ def segment_with_box(
     box: tuple[int, int, int, int],
     checkpoint: Path,
     device: str = "auto",
+    point_coords: list[tuple[float, float]] | np.ndarray | None = None,
+    point_labels: list[int] | np.ndarray | None = None,
 ) -> SegmentationResult:
-    return SamSegmentationEngine(checkpoint, device=device).segment_with_box(image, box)
+    return SamSegmentationEngine(checkpoint, device=device).segment_with_box(
+        image,
+        box,
+        point_coords=point_coords,
+        point_labels=point_labels,
+    )

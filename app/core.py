@@ -8,11 +8,12 @@ import sys
 import json
 import hashlib
 import tempfile
+import time
 import traceback
 import importlib
 import importlib.util
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from statistics import median
 from typing import Callable
@@ -95,6 +96,18 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
+
+from .quality_pipeline import (
+    OpenAIImageRepairBackend,
+    PageQualityResult,
+    QualityMode,
+    QualityPipeline,
+    QualityStatus,
+    build_background_erase_mask,
+    decontaminate_asset_rgba,
+    expand_text_erase_mask,
+    refine_asset_alpha,
+)
 
 
 SKIP_TEXTS = {"NotebookLM"}
@@ -281,6 +294,9 @@ class VisualAsset:
     confirmed: bool = False
     model_id: str | None = None
     mask_version: int = 0
+    segmentation_warning: str | None = None
+    sam_selected_index: int | None = None
+    sam_points: tuple[tuple[float, float, int], ...] = ()
 
 
 @dataclass
@@ -407,6 +423,9 @@ def visual_asset_to_data(asset: VisualAsset) -> dict:
         "confirmed": bool(asset.confirmed),
         "model_id": asset.model_id,
         "mask_version": int(asset.mask_version),
+        "segmentation_warning": asset.segmentation_warning,
+        "sam_selected_index": asset.sam_selected_index,
+        "sam_points": [list(point) for point in asset.sam_points],
     }
 
 
@@ -425,6 +444,13 @@ def visual_asset_from_data(data: dict) -> VisualAsset:
         confirmed=bool(data.get("confirmed", False)),
         model_id=str(data["model_id"]) if data.get("model_id") else None,
         mask_version=int(data.get("mask_version", 0)),
+        segmentation_warning=str(data["segmentation_warning"]) if data.get("segmentation_warning") else None,
+        sam_selected_index=_optional_int(data.get("sam_selected_index")),
+        sam_points=tuple(
+            (float(point[0]), float(point[1]), int(point[2]))
+            for point in data.get("sam_points", [])
+            if isinstance(point, (list, tuple)) and len(point) == 3
+        ),
     )
 
 def save_project_cache(project: PPTProject, cache_path: Path | None = None, progress: ProgressCB = None) -> Path:
@@ -1234,6 +1260,10 @@ def run_export_editable_ppt_subprocess(
     output_pptx: Path,
     progress: ProgressCB = None,
     enhance_images: bool = True,
+    quality_mode: QualityMode = QualityMode.LOCAL_FAST,
+    online_pages: set[int] | None = None,
+    accepted_local_pages: set[int] | None = None,
+    openai_api_key: str | None = None,
     popen=subprocess.Popen,
     timeout: int | None = None,
 ) -> Path:
@@ -1245,6 +1275,9 @@ def run_export_editable_ppt_subprocess(
             "project": ppt_project_to_data(project),
             "output_pptx": str(output_pptx),
             "enhance_images": bool(enhance_images),
+            "quality_mode": QualityMode(quality_mode).value,
+            "online_pages": sorted(set(online_pages or ())),
+            "accepted_local_pages": sorted(set(accepted_local_pages or ())),
         }
         input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
@@ -1253,6 +1286,8 @@ def run_export_editable_ppt_subprocess(
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONFAULTHANDLER"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        if openai_api_key:
+            env["PPTTOEDIT_OPENAI_API_KEY"] = openai_api_key
         if getattr(sys, "frozen", False):
             command = [sys.executable, "--export-worker", str(input_path)]
         else:
@@ -1468,15 +1503,18 @@ def visual_asset_alpha_mask(image: np.ndarray, asset: VisualAsset, boxes: list[O
     alpha = np.zeros((height, width), dtype=np.uint8)
     if right <= left or bottom <= top:
         return alpha
-    if asset.segmentation_mode == "sam2" and asset.mask_path and asset.mask_path.is_file():
+    if asset.segmentation_mode == "sam2":
+        if asset.segmentation_warning or not asset.mask_path or not asset.mask_path.is_file():
+            return alpha
         with Image.open(asset.mask_path) as stored_mask:
             cropped = np.asarray(stored_mask.convert("L"))
         expected_shape = (bottom - top, right - left)
-        if cropped.shape == expected_shape:
-            alpha[top:bottom, left:right] = cropped
-        else:
-            asset.status = "fallback"
+        if cropped.shape != expected_shape:
+            return alpha
+        alpha[top:bottom, left:right] = cropped
     if not np.any(alpha[top:bottom, left:right]):
+        if asset.segmentation_mode == "sam2":
+            return alpha
         foreground = _visual_foreground_mask(image)
         alpha[top:bottom, left:right] = foreground[top:bottom, left:right]
     if not np.any(alpha[top:bottom, left:right]):
@@ -1529,7 +1567,7 @@ def soft_blend_inpaint(
     mask: np.ndarray,
     feather_px: int = 24,
 ) -> np.ndarray:
-    """Blend repaired pixels through a soft mask while leaving distant pixels untouched."""
+    """Keep repaired pixels inside the mask and feather only into the surrounding edge."""
     if original.shape != repaired.shape or original.shape[:2] != mask.shape[:2]:
         raise ValueError("修复图、原图和蒙版尺寸必须一致。")
     binary = np.zeros(mask.shape[:2], dtype=np.uint8)
@@ -1539,9 +1577,8 @@ def soft_blend_inpaint(
     feather_px = max(1, int(feather_px))
     kernel_size = feather_px * 2 + 1
     soft = cv2.GaussianBlur(binary, (kernel_size, kernel_size), sigmaX=max(1.0, feather_px / 3))
-    # Keep the interior fully repaired and use the blur only around its boundary.
-    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
-    soft[distance >= feather_px] = 255
+    # Never blend the source content back into the area that the model repaired.
+    soft[binary > 0] = 255
     weight = soft.astype(np.float32)[:, :, None] / 255.0
     blended = repaired.astype(np.float32) * weight + original.astype(np.float32) * (1.0 - weight)
     return np.clip(np.rint(blended), 0, 255).astype(np.uint8)
@@ -1600,7 +1637,124 @@ def _clean_segmentation_mask(mask: np.ndarray, asset: VisualAsset, boxes: list[O
     return cv2.GaussianBlur(cleaned, (3, 3), sigmaX=0.6)
 
 
-def store_visual_asset_mask(project: PPTProject, slide: PPTSlide, asset: VisualAsset, result):
+def evaluate_segmentation_mask(mask: np.ndarray, asset: VisualAsset) -> tuple[dict[str, float | int], str | None]:
+    binary = np.zeros(np.asarray(mask).shape[:2], dtype=np.uint8)
+    binary[np.asarray(mask) > 0] = 255
+    height, width = binary.shape
+    x, y, asset_width, asset_height = asset.bbox
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(width, x + asset_width), min(height, y + asset_height)
+    box_area = max(1, (right - left) * (bottom - top))
+    inside = binary[top:bottom, left:right]
+    area = int(np.count_nonzero(inside))
+    area_ratio = area / box_area
+
+    ys, xs = np.nonzero(inside)
+    if area:
+        bbox_width = int(xs.max() - xs.min() + 1)
+        bbox_height = int(ys.max() - ys.min() + 1)
+        bbox_area = bbox_width * bbox_height
+    else:
+        bbox_width = bbox_height = bbox_area = 0
+    bbox_coverage = bbox_area / box_area
+    fill_ratio = area / max(1, bbox_area)
+
+    component_count = 0
+    largest_component_ratio = 0.0
+    if area:
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(inside, connectivity=8)
+        component_areas = [int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, count)]
+        component_count = len(component_areas)
+        largest_component_ratio = max(component_areas, default=0) / area
+
+    border = max(1, int(round(min(max(1, inside.shape[0]), max(1, inside.shape[1])) * 0.03)))
+    border_mask = np.zeros_like(inside)
+    if inside.size:
+        border_mask[:border, :] = 255
+        border_mask[-border:, :] = 255
+        border_mask[:, :border] = 255
+        border_mask[:, -border:] = 255
+    edge_contact_ratio = int(np.count_nonzero((inside > 0) & (border_mask > 0))) / max(1, area)
+
+    source = np.asarray(mask)
+    intermediate_ratio = int(np.count_nonzero((source > 0) & (source < 255))) / box_area
+    metrics: dict[str, float | int] = {
+        "area_pixels": area,
+        "area_ratio": round(area_ratio, 6),
+        "bbox_coverage": round(bbox_coverage, 6),
+        "fill_ratio": round(fill_ratio, 6),
+        "component_count": component_count,
+        "largest_component_ratio": round(largest_component_ratio, 6),
+        "edge_contact_ratio": round(edge_contact_ratio, 6),
+        "intermediate_alpha_ratio": round(intermediate_ratio, 6),
+    }
+
+    warnings = []
+    if not area:
+        warnings.append("蒙版为空")
+    elif area_ratio < 0.05 or bbox_coverage < 0.55:
+        warnings.append("疑似只选择了局部结构")
+    if component_count > 12 or (component_count > 1 and largest_component_ratio < 0.50):
+        warnings.append("蒙版过于碎片化")
+    if area_ratio > 0.40 and bbox_coverage > 0.45 and fill_ratio > 0.92:
+        warnings.append("疑似选中了大面积矩形背景")
+    if area_ratio > 0.70 and edge_contact_ratio > 0.35:
+        warnings.append("蒙版主要贴着候选框边缘，疑似背景区域")
+    if intermediate_ratio > 0.25 and area_ratio > 0.75 and fill_ratio > 0.85:
+        warnings.append("蒙版包含大面积半透明矩形")
+    return metrics, "；".join(warnings) if warnings else None
+
+
+def save_segmentation_debug(
+    project: PPTProject,
+    slide: PPTSlide,
+    asset: VisualAsset,
+    result,
+    points: list[tuple[float, float, int]] | tuple[tuple[float, float, int], ...] = (),
+    run_id: str | None = None,
+) -> Path:
+    run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
+    debug_dir = project.work_dir / "debug_masks" / f"slide_{slide.index:02d}" / asset.asset_id / run_id
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    with Image.open(slide.image_path) as source_image:
+        source = np.asarray(source_image.convert("RGB"))
+    x, y, asset_width, asset_height = asset.bbox
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(slide.image_width, x + asset_width), min(slide.image_height, y + asset_height)
+    Image.fromarray(source[top:bottom, left:right]).save(debug_dir / "source_crop.png")
+    (debug_dir / "box.json").write_text(
+        json.dumps({"bbox": list(asset.bbox), "points": [list(point) for point in points]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    candidates = []
+    for index, (mask, score) in enumerate(zip(result.masks, result.scores), start=1):
+        candidate = np.zeros(np.asarray(mask).shape[:2], dtype=np.uint8)
+        candidate[np.asarray(mask) > 0] = 255
+        Image.fromarray(candidate).save(debug_dir / f"candidate_{index}_raw.png")
+        metrics, warning = evaluate_segmentation_mask(candidate, asset)
+        candidates.append({"index": index - 1, "score": float(score), "metrics": metrics, "warning": warning})
+    (debug_dir / "scores.json").write_text(
+        json.dumps(
+            {"selected_index": int(result.selected_index), "device": result.device, "model_id": result.model_id, "candidates": candidates},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    selected_cleaned = _clean_segmentation_mask(result.mask, asset, slide.boxes)
+    Image.fromarray(selected_cleaned).save(debug_dir / "selected_cleaned.png")
+    rgba = np.dstack((source[top:bottom, left:right], selected_cleaned[top:bottom, left:right]))
+    Image.fromarray(rgba, "RGBA").save(debug_dir / "selected_asset.png")
+    return debug_dir
+
+
+def store_visual_asset_mask(
+    project: PPTProject,
+    slide: PPTSlide,
+    asset: VisualAsset,
+    result,
+    points: list[tuple[float, float, int]] | tuple[tuple[float, float, int], ...] = (),
+):
     if result.mask.shape[:2] != (slide.image_height, slide.image_width):
         raise ValueError("SAM 2.1 蒙版尺寸与幻灯片图片不一致。")
     with Image.open(slide.image_path) as source_image:
@@ -1608,11 +1762,20 @@ def store_visual_asset_mask(project: PPTProject, slide: PPTSlide, asset: VisualA
     alpha = _clean_segmentation_mask(result.mask, asset, slide.boxes)
     if not np.any(alpha):
         raise RuntimeError("SAM 2.1 未在候选框内找到有效图片区域。")
+    _metrics, warning = evaluate_segmentation_mask(alpha, asset)
+    if warning:
+        asset.segmentation_warning = warning
+        asset.status = "segmentation_warning"
+        asset.confirmed = False
+        raise RuntimeError(f"SAM 2.1 蒙版未通过安全检查：{warning}")
     _write_visual_asset(project, slide, asset, image, alpha)
     asset.segmentation_mode = "sam2"
     asset.confidence = float(result.confidence)
     asset.model_id = str(result.model_id)
     asset.mask_version = 1
+    asset.segmentation_warning = None
+    asset.sam_selected_index = int(result.selected_index)
+    asset.sam_points = tuple((float(px), float(py), int(label)) for px, py, label in points)
     asset.confirmed = True
     asset.status = "confirmed"
 
@@ -1629,9 +1792,17 @@ def _write_visual_asset(project: PPTProject, slide: PPTSlide, asset: VisualAsset
     stem = f"{slide.image_path.stem}-{asset.asset_id}"
     image_path = assets_dir / f"{stem}.png"
     mask_path = assets_dir / f"{stem}.mask.png"
-    rgba = np.dstack((image[top:bottom, left:right], alpha[top:bottom, left:right]))
+    local_alpha = refine_asset_alpha(image[top:bottom, left:right], alpha[top:bottom, left:right])
+    expanded = build_background_erase_mask(local_alpha, 3)
+    ring = (expanded > 0) & (local_alpha == 0)
+    page_crop = image[top:bottom, left:right]
+    samples = page_crop[ring]
+    if samples.size == 0:
+        samples = np.concatenate((page_crop[0], page_crop[-1], page_crop[:, 0], page_crop[:, -1]), axis=0)
+    background_rgb = tuple(int(value) for value in np.median(samples, axis=0))
+    rgba = decontaminate_asset_rgba(np.dstack((page_crop, local_alpha)), background_rgb)
     Image.fromarray(rgba, "RGBA").save(image_path)
-    Image.fromarray(alpha[top:bottom, left:right]).save(mask_path)
+    Image.fromarray(local_alpha).save(mask_path)
     asset.image_path = image_path
     asset.mask_path = mask_path
 
@@ -1678,8 +1849,15 @@ def build_text_stroke_mask(image: np.ndarray, box: OCRBox) -> tuple[np.ndarray, 
     if large_thin_component:
         return _rect_mask(image_width, image_height, box.erase_rect), "rectangle_fallback", "检测到大面积连通线条，可能与插图重叠"
 
-    strokes = cv2.dilate(strokes, np.ones((3, 3), dtype=np.uint8), iterations=1)
-    return strokes, "text_stroke", None
+    line_height = max(1, int(box.line_height or box.bbox[3]))
+    expansion_radius = min(4, max(1, int(round(line_height * 0.08))))
+    kernel_size = expansion_radius * 2 + 1
+    strokes = cv2.dilate(
+        strokes,
+        np.ones((kernel_size, kernel_size), dtype=np.uint8),
+        iterations=1,
+    )
+    return cv2.bitwise_and(strokes, allowed), "text_stroke", None
 
 
 def build_masks(project: PPTProject, progress: ProgressCB = None):
@@ -1694,11 +1872,20 @@ def build_masks(project: PPTProject, progress: ProgressCB = None):
             if not box.enabled:
                 continue
             box_mask, box.mask_mode, box.mask_reason = build_text_stroke_mask(image, box)
-            mask = cv2.bitwise_or(mask, box_mask)
+            text_erase_mask = expand_text_erase_mask(box_mask, int(box.line_height or box.bbox[3]))
+            mask = cv2.bitwise_or(mask, text_erase_mask)
             if box.mask_reason:
                 _log(progress, f"第 {slide.index} 页文字框已回退矩形擦除：{box.mask_reason}")
         for asset in slide.visual_assets:
             if not asset.enabled or not asset.confirmed:
+                continue
+            if asset.segmentation_mode == "sam2" and (
+                asset.segmentation_warning
+                or asset.status == "segmentation_warning"
+                or not asset.mask_path
+                or not asset.mask_path.is_file()
+            ):
+                _log(progress, f"第 {slide.index} 页 SAM 图片未确认或存在警告，已保留原底图：{asset.asset_id}")
                 continue
             alpha = visual_asset_alpha_mask(image, asset, slide.boxes)
             if not np.any(alpha):
@@ -1707,7 +1894,8 @@ def build_masks(project: PPTProject, progress: ProgressCB = None):
                 _log(progress, f"第 {slide.index} 页图片区候选为空，已跳过：{asset.asset_id}")
                 continue
             _write_visual_asset(project, slide, asset, image, alpha)
-            mask = cv2.bitwise_or(mask, alpha)
+            expansion = min(20, max(3, int(round(min(asset.bbox[2], asset.bbox[3]) * 0.04))))
+            mask = cv2.bitwise_or(mask, build_background_erase_mask(alpha, expansion))
         if slide.remove_watermark and slide.watermark_rect:
             left, top, right, bottom = slide.watermark_rect
             cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
@@ -1746,7 +1934,14 @@ def repair_visual_assets(
             page = np.asarray(source_image.convert("RGB"))
         page_height, page_width = page.shape[:2]
         for asset in slide.visual_assets:
-            if not asset.enabled or not asset.confirmed or not asset.image_path or not asset.image_path.is_file():
+            if (
+                not asset.enabled
+                or not asset.confirmed
+                or asset.segmentation_warning
+                or asset.status == "segmentation_warning"
+                or not asset.image_path
+                or not asset.image_path.is_file()
+            ):
                 continue
             text_mask = build_asset_text_mask(page, asset, slide.boxes)
             if not np.any(text_mask):
@@ -1824,10 +2019,10 @@ def run_iopaint(
     cleaned_dir: Path,
     progress: ProgressCB = None,
     project: PPTProject | None = None,
+    skip_stems: set[str] | None = None,
 ):
-    if cleaned_dir.exists():
-        shutil.rmtree(cleaned_dir)
     cleaned_dir.mkdir(parents=True, exist_ok=True)
+    skip_stems = skip_stems or set()
     _log(progress, "开始用 IOPaint 擦除底图文字")
 
     env = os_environ_with_pythonpath()
@@ -1871,6 +2066,10 @@ def run_iopaint(
         model = LaMa(device=device)
         inpaint_request = InpaintRequest()
         for done, (stem, image_path) in enumerate(sorted(image_paths.items()), start=1):
+            if stem in skip_stems:
+                _log(progress, f"第 {done} 页复用已验证的本地修复结果：{stem}")
+                _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
+                continue
             mask_path = mask_paths.get(stem, first_mask)
             with Image.open(image_path) as source_image:
                 infos = source_image.info
@@ -1897,7 +2096,7 @@ def run_iopaint(
             torch_gc()
             _log(progress, f"第 {done} 页 IOPaint 擦除后已生成：{compressed_path.name}")
             _progress(progress, int(done * 100 / total_images), f"IOPaint 擦除处理中：{done}/{total_images}")
-        if project is not None:
+        if project is not None and len(skip_stems) < total_images:
             repair_visual_assets(project, model, inpaint_request, progress)
 
     device = preferred_iopaint_device(Device)
@@ -1907,8 +2106,6 @@ def run_iopaint(
         if device == Device.cpu:
             raise
         _log(progress, f"IOPaint CUDA 处理失败，已回退 CPU：{exc}")
-        if cleaned_dir.exists():
-            shutil.rmtree(cleaned_dir)
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         process_with_device(Device.cpu)
 
@@ -1917,6 +2114,145 @@ def run_iopaint(
         raise RuntimeError(f"IOPaint 未生成以下页面：{', '.join(sorted(missing))}")
 
     _log(progress, "IOPaint 擦除完成")
+
+
+def _write_openai_edit_mask(erase_mask: np.ndarray, output_path: Path) -> Path:
+    binary = np.asarray(erase_mask) > 0
+    rgba = np.full((*binary.shape, 4), 255, dtype=np.uint8)
+    rgba[:, :, 3][binary] = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgba, "RGBA").save(output_path)
+    return output_path
+
+
+def run_quality_iopaint(
+    project: PPTProject,
+    progress: ProgressCB = None,
+    *,
+    quality_mode: QualityMode = QualityMode.LOCAL_FAST,
+    online_pages: set[int] | None = None,
+    accepted_local_pages: set[int] | None = None,
+    openai_api_key: str | None = None,
+) -> list[PageQualityResult]:
+    """Run the existing local repair only for invalidated pages and persist page-level QA."""
+    online_pages = set(online_pages or ())
+    accepted_local_pages = set(accepted_local_pages or ())
+    pipeline = QualityPipeline(project.work_dir / "quality")
+    project.cleaned_dir.mkdir(parents=True, exist_ok=True)
+    sessions = {}
+    pending_stems: set[str] = set()
+    slide_by_stem = {slide.image_path.stem: slide for slide in project.slides}
+
+    for stem, slide in slide_by_stem.items():
+        mask_path = project.masks_dir / slide.image_name
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"缺少第 {slide.index} 页擦除蒙版：{mask_path}")
+        settings = {
+            "quality_manifest_version": 1,
+            "repair_backend": "local_lama",
+            "mask_sha256": hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+            "asset_mask_versions": [asset.mask_version for asset in slide.visual_assets if asset.enabled],
+        }
+        session = pipeline.begin_page(slide.index, slide.image_path, settings)
+        sessions[stem] = session
+        output_path = project.cleaned_dir / f"{stem}.png"
+        if session.reused and session.result.cleaned_path:
+            shutil.copyfile(session.result.cleaned_path, output_path)
+            with Image.open(output_path) as cached:
+                save_compressed_cleaned_image(cached.convert("RGB"), output_path)
+            _log(progress, f"第 {slide.index} 页质量缓存命中，跳过本地修复")
+        else:
+            pending_stems.add(stem)
+
+    if pending_stems:
+        run_iopaint(
+            project.images_dir,
+            project.masks_dir,
+            project.cleaned_dir,
+            progress,
+            project=project,
+            skip_stems=set(slide_by_stem) - pending_stems,
+        )
+    else:
+        _log(progress, "所有页面均命中已验证质量缓存，已跳过 IOPaint")
+
+    backend = OpenAIImageRepairBackend(openai_api_key) if online_pages else None
+    results: list[PageQualityResult] = []
+    for stem, slide in slide_by_stem.items():
+        session = sessions[stem]
+        if session.reused:
+            results.append(session.result)
+            continue
+        output_path = project.cleaned_dir / f"{stem}.png"
+        mask_path = project.masks_dir / slide.image_name
+        with Image.open(slide.image_path) as source_image, Image.open(output_path) as repaired_image, Image.open(mask_path) as mask_image:
+            source = np.asarray(source_image.convert("RGB"))
+            repaired = np.asarray(repaired_image.convert("RGB"))
+            erase_mask = np.asarray(mask_image.convert("L"))
+
+        cache_path = pipeline.page_dir(slide.index) / "local_cleaned.png"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(output_path, cache_path)
+        result = pipeline.evaluate_local_quality(
+            slide.index,
+            source,
+            repaired,
+            erase_mask,
+            source_path=slide.image_path,
+            cleaned_path=cache_path,
+        )
+
+        if slide.index in online_pages:
+            try:
+                assert backend is not None
+                edit_mask = _write_openai_edit_mask(erase_mask, cache_path.parent / "openai_edit_mask.png")
+                online_path = cache_path.parent / "online_cleaned.png"
+                backend.repair_background(
+                    slide.image_path,
+                    edit_mask,
+                    online_path,
+                    "Remove only the transparent masked text and foreground remnants. Preserve the original composition, colours, perspective, lighting, texture, and all unmasked content. Do not add text, logos, or new objects.",
+                )
+                with Image.open(online_path) as online_image:
+                    online = np.asarray(online_image.convert("RGB"))
+                if online.shape != source.shape:
+                    raise RuntimeError("在线修复返回的页面尺寸与原图不一致。")
+                online_result = pipeline.evaluate_local_quality(
+                    slide.index,
+                    source,
+                    online,
+                    erase_mask,
+                    source_path=slide.image_path,
+                    cleaned_path=online_path,
+                )
+                if online_result.status == QualityStatus.LOCAL_PROCESSED:
+                    result = replace(online_result, status=QualityStatus.VALIDATED, mode=QualityMode.ONLINE_REPAIR)
+                    shutil.copyfile(online_path, output_path)
+                    with Image.open(output_path) as online_output:
+                        save_compressed_cleaned_image(online_output.convert("RGB"), output_path)
+                else:
+                    result = replace(
+                        result,
+                        status=QualityStatus.REVIEW_REQUIRED,
+                        issues=tuple((*result.issues, "online_quality_check_failed")),
+                    )
+            except Exception as exc:
+                result = replace(
+                    result,
+                    status=QualityStatus.REVIEW_REQUIRED,
+                    issues=tuple((*result.issues, "online_repair_failed")),
+                )
+                _log(progress, f"第 {slide.index} 页在线高质量修复失败，已保留本地结果：{exc}")
+
+        if result.status == QualityStatus.LOCAL_PROCESSED:
+            result = replace(result, status=QualityStatus.VALIDATED)
+        elif slide.index in accepted_local_pages:
+            result = replace(result, status=QualityStatus.VALIDATED, mode=QualityMode.LOCAL_REVIEWED)
+        pipeline.complete_page(session, result)
+        results.append(result)
+        if result.status == QualityStatus.REVIEW_REQUIRED:
+            _log(progress, f"第 {slide.index} 页需要人工检查：{', '.join(result.issues)}")
+    return results
 
 
 def save_compressed_cleaned_image(image: Image.Image, source_path: Path, quality: int = EXPORT_IMAGE_JPEG_QUALITY) -> Path:
@@ -2258,9 +2594,20 @@ def export_editable_ppt(
     output_pptx: Path,
     progress: ProgressCB = None,
     enhance_images: bool = True,
+    quality_mode: QualityMode = QualityMode.LOCAL_FAST,
+    online_pages: set[int] | None = None,
+    accepted_local_pages: set[int] | None = None,
+    openai_api_key: str | None = None,
 ):
     build_masks(project, progress)
-    run_iopaint(project.images_dir, project.masks_dir, project.cleaned_dir, progress, project=project)
+    run_quality_iopaint(
+        project,
+        progress,
+        quality_mode=quality_mode,
+        online_pages=online_pages,
+        accepted_local_pages=accepted_local_pages,
+        openai_api_key=openai_api_key,
+    )
     if enhance_images:
         upscale_cleaned_images(project.cleaned_dir, progress=progress)
     else:

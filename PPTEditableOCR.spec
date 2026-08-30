@@ -78,6 +78,8 @@ packages = [
     "paddle",
     "cv2",
     "numpy",
+    "pymatting",
+    "openai",
     "PIL",
     "pptx",
     "lxml",

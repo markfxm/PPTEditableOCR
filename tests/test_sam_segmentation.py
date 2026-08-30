@@ -23,14 +23,23 @@ class FakePredictor:
         self.device = device
         self.fail_predict = fail_predict
         self.set_image_calls = 0
+        self.predict_calls = []
 
     def set_image(self, image):
         self.set_image_calls += 1
         self.image_shape = image.shape[:2]
 
-    def predict(self, box, multimask_output=True):
+    def predict(self, box, point_coords=None, point_labels=None, multimask_output=True):
         if self.fail_predict:
             raise RuntimeError("CUDA out of memory")
+        self.predict_calls.append(
+            {
+                "box": np.asarray(box).copy(),
+                "point_coords": None if point_coords is None else np.asarray(point_coords).copy(),
+                "point_labels": None if point_labels is None else np.asarray(point_labels).copy(),
+                "multimask_output": multimask_output,
+            }
+        )
         height, width = self.image_shape
         masks = np.zeros((3, height, width), dtype=bool)
         masks[0, 2:5, 3:7] = True
@@ -154,7 +163,7 @@ class SamSegmentationEngineTests(unittest.TestCase):
         self.assertTrue(model.eval_called)
         self.assertEqual(thread_limits, [4])
 
-    def test_reuses_page_embedding_and_selects_highest_quality_mask(self):
+    def test_reuses_page_embedding_and_keeps_all_masks_with_highest_score_selected(self):
         predictor = FakePredictor()
         engine = SamSegmentationEngine(
             Path("model.pt"),
@@ -167,11 +176,37 @@ class SamSegmentationEngineTests(unittest.TestCase):
         second = engine.segment_with_box(image, (3, 2, 9, 7), image_key="slide-1")
 
         self.assertEqual(predictor.set_image_calls, 1)
+        self.assertEqual(first.masks.shape, (3, 10, 12))
+        self.assertEqual(first.scores.tolist(), [0.2, 0.9, 0.1])
+        self.assertEqual(first.selected_index, 1)
         self.assertEqual(first.confidence, 0.9)
         self.assertEqual(first.device, "cpu")
         self.assertEqual(first.mask.shape, (10, 12))
         self.assertEqual(int(np.count_nonzero(first.mask)), 30)
         self.assertEqual(second.model_id, "sam2.1_hiera_tiny")
+
+    def test_box_and_positive_negative_points_are_passed_to_predictor(self):
+        predictor = FakePredictor()
+        engine = SamSegmentationEngine(
+            Path("model.pt"),
+            device="cpu",
+            predictor_factory=lambda _path, _device: predictor,
+        )
+
+        result = engine.segment_with_box(
+            np.zeros((10, 12, 3), dtype=np.uint8),
+            (2, 1, 8, 6),
+            point_coords=[(4, 3), (10, 8)],
+            point_labels=[1, 0],
+            image_key="slide-1",
+        )
+
+        call = predictor.predict_calls[0]
+        self.assertEqual(call["box"].tolist(), [2.0, 1.0, 8.0, 6.0])
+        self.assertEqual(call["point_coords"].tolist(), [[4.0, 3.0], [10.0, 8.0]])
+        self.assertEqual(call["point_labels"].tolist(), [1, 0])
+        self.assertTrue(call["multimask_output"])
+        self.assertEqual(result.selected_index, 1)
 
     def test_cuda_failure_retries_with_cpu_predictor(self):
         created = []

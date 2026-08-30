@@ -4,6 +4,7 @@ import sys
 import traceback
 import os
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +17,7 @@ for deps_name in [".py310gui", ".py310iopaint", ".py310deps"]:
         sys.path.insert(0, str(deps))
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -69,11 +70,14 @@ from .core import (
     REMOTE_OCR_TOKEN_LENGTH,
     VisualAsset,
     detect_visual_assets,
+    evaluate_segmentation_mask,
+    save_segmentation_debug,
     store_visual_asset_mask,
     visual_asset_from_data,
     visual_asset_to_data,
 )
 from .ocr_config import resolve_ocr_config
+from .quality_pipeline import QualityPipeline, QualityStatus
 from .sam_segmentation import (
     MODEL_FILENAME,
     MODEL_ID,
@@ -86,8 +90,8 @@ from .sam_segmentation import (
 
 FLOW_TEXT = (
     "1. 打开 PPT/PDF --> 2. 选择 OCR 方式并识别 --> "
-    "3. 检查识别框 --> 4. 图片拆分 --> 5. IOPaint 擦除 --> "
-    "6. 选择是否清晰化 --> 7. 导出可编辑 PPT"
+    "3. 检查识别框 --> 4. IOPaint 擦除（含图片拆分） --> "
+    "5. 选择是否清晰化 --> 6. 质量检查与可选在线修复 --> 7. 导出可编辑 PPT"
 )
 
 BoxSnapshot = list[
@@ -439,6 +443,9 @@ class EditableAssetItem(QGraphicsRectItem):
         self.asset.model_id = None
         self.asset.image_path = None
         self.asset.mask_path = None
+        self.asset.segmentation_warning = None
+        self.asset.sam_selected_index = None
+        self.asset.sam_points = ()
         self._update_pen()
         self.changed_cb(self, before_change=False)
 
@@ -463,6 +470,198 @@ class PPTGraphicsView(QGraphicsView):
             self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
 
+class SamPromptView(QGraphicsView):
+    point_clicked = Signal(float, float, int)
+
+    def mousePressEvent(self, event):
+        if event.button() in {Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton}:
+            point = self.mapToScene(event.position().toPoint())
+            label = 1 if event.button() == Qt.MouseButton.LeftButton else 0
+            self.point_clicked.emit(point.x(), point.y(), label)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+
+class SamMaskReviewDialog(QDialog):
+    def __init__(self, source_image, asset, result, regenerate_cb=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SAM 2.1 分割校正")
+        self.resize(900, 700)
+        self.source_image = np.asarray(source_image).copy()
+        self.asset = asset
+        self.result = result
+        self.regenerate_cb = regenerate_cb
+        self.points: list[tuple[float, float, int]] = []
+        self.debug_dir: Path | None = None
+        self.current_warning: str | None = None
+
+        layout = QVBoxLayout(self)
+        self.candidate_label = QLabel()
+        self.candidate_label.setWordWrap(True)
+        layout.addWidget(self.candidate_label)
+        self.preview_scene = QGraphicsScene(self)
+        self.preview_view = SamPromptView(self)
+        self.preview_view.setScene(self.preview_scene)
+        self.preview_view.point_clicked.connect(self._on_preview_point)
+        layout.addWidget(self.preview_view, 1)
+
+        candidate_row = QHBoxLayout()
+        self.previous_btn = QPushButton("上一个蒙版")
+        self.next_btn = QPushButton("下一个蒙版")
+        self.previous_btn.clicked.connect(self.previous_candidate)
+        self.next_btn.clicked.connect(self.next_candidate)
+        candidate_row.addWidget(self.previous_btn)
+        candidate_row.addWidget(self.next_btn)
+        layout.addLayout(candidate_row)
+
+        point_row = QHBoxLayout()
+        self.undo_point_btn = QPushButton("撤销提示点")
+        self.clear_points_btn = QPushButton("清除提示点")
+        self.undo_point_btn.clicked.connect(self.undo_prompt_point)
+        self.clear_points_btn.clicked.connect(self.clear_prompt_points)
+        point_row.addWidget(self.undo_point_btn)
+        point_row.addWidget(self.clear_points_btn)
+        layout.addLayout(point_row)
+
+        action_row = QHBoxLayout()
+        self.confirm_btn = QPushButton("确认分割")
+        self.cancel_btn = QPushButton("取消")
+        self.confirm_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+        action_row.addStretch(1)
+        action_row.addWidget(self.confirm_btn)
+        action_row.addWidget(self.cancel_btn)
+        layout.addLayout(action_row)
+        # The constructor runs before Qt has laid out the dialog.  Fitting at
+        # that point can produce a near-zero scale that is then preserved by
+        # the prompt-point workflow.  The first fit is deferred until show().
+        self._initial_fit_done = False
+        self.candidate_label.setMinimumHeight(
+            self.candidate_label.fontMetrics().lineSpacing() * 3 + 10
+        )
+        self.refresh_preview()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initial_fit_done:
+            self._initial_fit_done = True
+            QTimer.singleShot(0, lambda: self.refresh_preview(fit_to_view=True))
+
+    def set_result(self, result, debug_dir=None):
+        self.result = result
+        self.debug_dir = Path(debug_dir) if debug_dir else None
+        self.set_busy(False)
+        self.refresh_preview()
+
+    def accept(self):
+        if self.current_warning:
+            return
+        super().accept()
+
+    def set_busy(self, busy: bool):
+        for widget in (
+            self.previous_btn,
+            self.next_btn,
+            self.undo_point_btn,
+            self.clear_points_btn,
+            self.confirm_btn,
+        ):
+            widget.setEnabled(not busy)
+        if busy:
+            self.candidate_label.setText(
+                "正在根据提示点重新生成 SAM 候选...\n"
+                "提示点已保留，正在更新蒙版。\n"
+                "请稍候..."
+            )
+
+    def previous_candidate(self):
+        index = (self.result.selected_index - 1) % len(self.result.masks)
+        self.result = self.result.select(index)
+        self.refresh_preview()
+
+    def next_candidate(self):
+        index = (self.result.selected_index + 1) % len(self.result.masks)
+        self.result = self.result.select(index)
+        self.refresh_preview()
+
+    def _on_preview_point(self, local_x: float, local_y: float, label: int):
+        x, y, _width, _height = self.asset.bbox
+        self.add_prompt_point(x + local_x, y + local_y, label)
+
+    def add_prompt_point(self, x: float, y: float, label: int):
+        self.points.append((float(x), float(y), int(label)))
+        self.refresh_preview()
+        self._request_regeneration()
+
+    def undo_prompt_point(self):
+        if self.points:
+            self.points.pop()
+        self.refresh_preview()
+        self._request_regeneration()
+
+    def clear_prompt_points(self):
+        self.points.clear()
+        self.refresh_preview()
+        self._request_regeneration()
+
+    def _request_regeneration(self):
+        if self.regenerate_cb:
+            self.set_busy(True)
+            self.regenerate_cb(list(self.points))
+        else:
+            self.refresh_preview()
+
+    def refresh_preview(self, fit_to_view: bool = False):
+        view_center = self.preview_view.mapToScene(self.preview_view.viewport().rect().center())
+        view_transform = self.preview_view.transform()
+        x, y, width, height = self.asset.bbox
+        left, top = max(0, x), max(0, y)
+        right = min(self.source_image.shape[1], x + width)
+        bottom = min(self.source_image.shape[0], y + height)
+        crop = self.source_image[top:bottom, left:right].copy()
+        mask = self.result.mask[top:bottom, left:right] > 0
+        overlay = crop.astype(np.float32)
+        color = np.asarray([0, 220, 255], dtype=np.float32)
+        overlay[mask] = overlay[mask] * 0.55 + color * 0.45
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        for px, py, label in self.points:
+            cx, cy = int(round(px - left)), int(round(py - top))
+            point_color = (40, 220, 80) if label == 1 else (240, 60, 60)
+            if 0 <= cx < overlay.shape[1] and 0 <= cy < overlay.shape[0]:
+                yy, xx = np.ogrid[:overlay.shape[0], :overlay.shape[1]]
+                overlay[(xx - cx) ** 2 + (yy - cy) ** 2 <= 25] = point_color
+        qimage = QImage(
+            overlay.data,
+            overlay.shape[1],
+            overlay.shape[0],
+            int(overlay.strides[0]),
+            QImage.Format.Format_RGB888,
+        ).copy()
+        self.preview_scene.clear()
+        self.preview_scene.addPixmap(QPixmap.fromImage(qimage))
+        self.preview_scene.setSceneRect(0, 0, overlay.shape[1], overlay.shape[0])
+        if fit_to_view:
+            self.preview_view.fitInView(self.preview_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        else:
+            self.preview_view.setTransform(view_transform)
+            self.preview_view.centerOn(view_center)
+
+        metrics, warning = evaluate_segmentation_mask(self.result.mask, self.asset)
+        self.current_warning = warning
+        warning_text = f"\n警告：{warning}" if warning else "\n安全检查：通过"
+        self.candidate_label.setText(
+            f"候选 {self.result.selected_index + 1}/{len(self.result.masks)} | "
+            f"score {self.result.confidence:.3f} | 面积 {metrics['area_ratio']:.1%} | "
+            f"框覆盖 {metrics['bbox_coverage']:.1%}{warning_text}\n"
+            "左键添加正向点，右键添加负向点。透明物体请在边框、沙子和玻璃轮廓添加正向点。"
+        )
+        self.confirm_btn.setEnabled(warning is None)
+
+
 class ManualDialog(QDialog):
     SECTIONS = [
         (
@@ -474,7 +673,8 @@ class ManualDialog(QDialog):
 3. 程序会提取每页图片；请先在右侧选择本地或远端 OCR，再点击“开始 OCR（按当前选择）”识别文字区域。
 4. OCR 完成后，在中间画布检查蓝色文字框，必要时调整、删除或新增框。
 5. 如需把页面底图中的插图拆成独立图片，在右侧“图片拆分（AI 可选）”中调整候选框并确认图片。
-6. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。""",
+6. 检查完成后，选择是否勾选“导出时清晰化底图（RealESRGAN）”，再点击右侧“继续：导出可编辑 PPT”或工具栏“导出可编辑 PPT”。
+7. 导出后的本地质量检查会只列出可能有残影、模糊或背景断线的页面。可接受本地结果，或输入一次性 OpenAI API Key 仅在线修复这些页；Key 不会保存。""",
         ),
         (
             "PDF 导入",
@@ -575,7 +775,10 @@ OpenCV 蒙版：
         (
             "导出与清晰化",
             """导出顺序：
-点击“导出可编辑 PPT”后，程序会先自动保存识别框，然后生成擦除蒙版，用 IOPaint/LaMa 擦除原图文字。若勾选“导出时清晰化底图（RealESRGAN）”，会再对清底图做 2x 清晰化，最后重建可编辑文本框并保存 PPT。
+点击“导出可编辑 PPT”后，程序会先自动保存识别框，然后生成擦除蒙版，用 IOPaint/LaMa 擦除原图文字。未变化且已验证页面会复用本地质量缓存。若勾选“导出时清晰化底图（RealESRGAN）”，会再对清底图做 2x 清晰化，最后重建可编辑文本框并保存 PPT。
+
+质量检查：
+导出后若发现残影、明显模糊、颜色漂移或复杂背景页面，会显示原图和本地修复预览。选择“接受本地结果”会使该页后续复用；选择“在线修复这些页”才会要求输入一次性 OpenAI API Key，并且只上传这些页面和对应透明蒙版。Key 不会保存到设置、缓存或日志。
 
 清晰化说明：
 RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等于还原真实原始细节。页数多或图片较大时，导出会更慢；不需要时可以取消勾选。
@@ -652,6 +855,70 @@ RealESRGAN 会提升底图分辨率和观感，但属于 AI 补细节，不等�
         self.content.setPlainText(f"{title}\n\n{text}")
 
 
+class QualityReviewDialog(QDialog):
+    ACCEPT_LOCAL = 1
+    REPAIR_ONLINE = 2
+
+    def __init__(self, results, parent=None):
+        super().__init__(parent)
+        self.results = list(results)
+        self.setWindowTitle("导出质量检查")
+        self.resize(980, 620)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("以下页面的本地修复可能存在残影、模糊或背景断线。请选择接受本地结果，或仅对这些页进行在线高质量修复。"))
+
+        body = QHBoxLayout()
+        self.pages = QListWidget()
+        for result in self.results:
+            self.pages.addItem(f"第 {result.page_index} 页：{', '.join(result.issues)}")
+        self.pages.currentRowChanged.connect(self.show_page)
+        body.addWidget(self.pages, 1)
+
+        previews = QVBoxLayout()
+        self.source_preview = QLabel("原图")
+        self.local_preview = QLabel("本地修复")
+        for preview in (self.source_preview, self.local_preview):
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setMinimumSize(360, 230)
+            preview.setStyleSheet("QLabel { border: 1px solid #d0d7de; background: #f6f8fa; }")
+            previews.addWidget(preview)
+        body.addLayout(previews, 2)
+        layout.addLayout(body, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        accept = QPushButton("接受本地结果")
+        repair = QPushButton("在线修复这些页")
+        cancel = QPushButton("稍后处理")
+        accept.clicked.connect(lambda: self.done(self.ACCEPT_LOCAL))
+        repair.clicked.connect(lambda: self.done(self.REPAIR_ONLINE))
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(accept)
+        buttons.addWidget(repair)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        if self.results:
+            self.pages.setCurrentRow(0)
+
+    def show_page(self, row: int):
+        if row < 0 or row >= len(self.results):
+            return
+        result = self.results[row]
+        self._set_preview(self.source_preview, result.source_path, "原图")
+        self._set_preview(self.local_preview, result.cleaned_path, "本地修复")
+
+    @staticmethod
+    def _set_preview(label: QLabel, path: Path | None, title: str):
+        if not path or not path.is_file():
+            label.setText(f"{title}不可用")
+            return
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            label.setText(f"{title}无法预览")
+            return
+        label.setPixmap(pixmap.scaled(500, 260, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+
 class MainWindow(QMainWindow):
     MAX_UNDO_STEPS = 50
     SETTINGS_ORG = "PPTtoEdit"
@@ -676,12 +943,16 @@ class MainWindow(QMainWindow):
         self.selecting_ppt_list_item = False
         self.pending_autoload_ppt: Path | None = None
         self.current_export_output: Path | None = None
+        self.current_export_options: dict[str, object] = {}
         self.ocr_next_index = 0
         self.ocr_backend: str = OCR_BACKEND_LOCAL
         self.ocr_token: str | None = None
         self.pending_ocr_error: tuple[str, object | None] | None = None
         self.sam_engine: SamSegmentationEngine | None = None
         self.pending_sam_asset: VisualAsset | None = None
+        self.pending_sam_slide: PPTSlide | None = None
+        self.pending_sam_points: list[tuple[float, float, int]] = []
+        self.sam_review_dialog: SamMaskReviewDialog | None = None
         self.sam_download_cancel: threading.Event | None = None
         self.sam_download_dialog: QProgressDialog | None = None
         self.sam_download_destination: Path | None = None
@@ -1449,7 +1720,13 @@ class MainWindow(QMainWindow):
             if not asset.enabled:
                 continue
             x, y, _width, _height = asset.bbox
-            if asset.confirmed and asset.image_path and asset.image_path.is_file():
+            if (
+                asset.confirmed
+                and not asset.segmentation_warning
+                and asset.status != "segmentation_warning"
+                and asset.image_path
+                and asset.image_path.is_file()
+            ):
                 preview = QGraphicsPixmapItem(QPixmap(str(asset.image_path)))
                 preview.setPos(x, y)
                 preview.setOpacity(0.55)
@@ -1774,7 +2051,7 @@ class MainWindow(QMainWindow):
             return
         self.push_undo_state()
         with Image.open(self.current_slide.image_path) as source:
-            image = np.asarray(source.convert("RGB"))
+            image = np.asarray(source.convert("RGB")).copy()
         self.current_slide.visual_assets = detect_visual_assets(image, self.current_slide)
         self.append_log(f"第 {self.current_slide.index} 页已识别出 {len(self.current_slide.visual_assets)} 个图片区候选")
         self.render_current_slide()
@@ -1813,6 +2090,9 @@ class MainWindow(QMainWindow):
         asset.mask_version = 0
         asset.image_path = None
         asset.mask_path = None
+        asset.segmentation_warning = None
+        asset.sam_selected_index = None
+        asset.sam_points = ()
         asset.confirmed = True
         asset.status = "confirmed"
         self.render_current_slide()
@@ -1831,51 +2111,146 @@ class MainWindow(QMainWindow):
     def _start_asset_segmentation(self, asset: VisualAsset):
         if not self.current_slide or not self.project:
             return
-        self.push_undo_state()
-        asset.status = "segmenting"
         slide = self.current_slide
         project = self.project
-        self.render_current_slide()
+        self.pending_sam_asset = asset
+        self.pending_sam_slide = slide
+        self.pending_sam_points = []
         self.run_worker(
             self._run_asset_segmentation,
             self.on_asset_segmented,
             project,
             slide,
             asset,
+            [],
             failed_cb=lambda message, exc: self.on_asset_segmentation_failed(asset, message, exc),
         )
 
-    def _run_asset_segmentation(self, project, slide, asset, progress=None):
+    def _run_asset_segmentation(self, project, slide, asset, points=None, progress=None):
         if progress:
             progress(f"第 {slide.index} 页正在执行 SAM 2.1 精细分割...")
         with Image.open(slide.image_path) as source:
-            image = np.asarray(source.convert("RGB"))
+            image = np.asarray(source.convert("RGB")).copy()
         if self.sam_engine is None:
             self.sam_engine = SamSegmentationEngine(self.current_sam_model_path(), device="auto")
         x, y, width, height = asset.bbox
+        points = list(points or [])
         result = self.sam_engine.segment_with_box(
             image,
             (x, y, x + width, y + height),
+            point_coords=[(px, py) for px, py, _label in points] or None,
+            point_labels=[label for _px, _py, label in points] or None,
             image_key=str(slide.image_path),
         )
-        store_visual_asset_mask(project, slide, asset, result)
-        return asset
+        debug_dir = save_segmentation_debug(project, slide, asset, result, points=points)
+        if progress:
+            for index, (mask, score) in enumerate(zip(result.masks, result.scores), start=1):
+                metrics, warning = evaluate_segmentation_mask(mask, asset)
+                suffix = f"，警告：{warning}" if warning else ""
+                progress(
+                    f"SAM 候选 {index}/{len(result.masks)}：score={float(score):.4f}，"
+                    f"面积比例={metrics['area_ratio']:.4f}，框覆盖={metrics['bbox_coverage']:.4f}{suffix}"
+                )
+            progress(f"SAM 调试结果：{debug_dir}")
+        return {"asset": asset, "slide": slide, "result": result, "points": points, "debug_dir": debug_dir}
 
-    def on_asset_segmented(self, asset):
+    def set_sam_progress_state(self, text: str, value: int):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, min(100, int(value))))
+        self.progress_label.setText(text)
+
+    def on_asset_segmented(self, payload):
+        asset = payload["asset"]
+        result = payload["result"]
+        debug_dir = payload["debug_dir"]
+        self.pending_sam_asset = asset
+        self.pending_sam_slide = payload["slide"]
+        self.pending_sam_points = list(payload["points"])
         self.append_log(
-            f"AI 精细分割完成：{asset.asset_id}，置信度 {asset.confidence:.3f}，设备 {self.sam_engine.device}"
+            f"AI 精细分割返回 {len(result.masks)} 个候选；默认候选 "
+            f"{result.selected_index + 1}，score {result.confidence:.3f}，设备 {result.device}"
         )
+        self.set_sam_progress_state("SAM 候选已生成，请检查并确认分割", 100)
+        if self.sam_review_dialog:
+            self.sam_review_dialog.points = list(self.pending_sam_points)
+            self.sam_review_dialog.set_result(result, debug_dir)
+            return
+        with Image.open(self.pending_sam_slide.image_path) as source:
+            image = np.asarray(source.convert("RGB")).copy()
+        dialog = SamMaskReviewDialog(
+            image,
+            asset,
+            result,
+            regenerate_cb=self.request_sam_regeneration,
+            parent=self,
+        )
+        dialog.debug_dir = debug_dir
+        dialog.accepted.connect(self.confirm_sam_review)
+        dialog.rejected.connect(self.on_sam_review_cancelled)
+        self.sam_review_dialog = dialog
+        dialog.open()
+
+    def request_sam_regeneration(self, points):
+        if not self.project or not self.pending_sam_slide or not self.pending_sam_asset:
+            return
+        self.pending_sam_points = list(points)
+        self.run_worker(
+            self._run_asset_segmentation,
+            self.on_asset_segmented,
+            self.project,
+            self.pending_sam_slide,
+            self.pending_sam_asset,
+            self.pending_sam_points,
+            failed_cb=lambda message, exc: self.on_asset_segmentation_failed(self.pending_sam_asset, message, exc),
+        )
+
+    def confirm_sam_review(self):
+        dialog = self.sam_review_dialog
+        asset = self.pending_sam_asset
+        slide = self.pending_sam_slide
+        if not dialog or not asset or not slide or not self.project:
+            return
+        metrics, warning = evaluate_segmentation_mask(dialog.result.mask, asset)
+        if warning:
+            QMessageBox.warning(self, "分割未确认", f"当前蒙版存在风险：{warning}\n请切换候选、添加提示点或重新框选。")
+            return
+        self.push_undo_state()
+        confirmed_debug = save_segmentation_debug(
+            self.project,
+            slide,
+            asset,
+            dialog.result,
+            points=dialog.points,
+            run_id=f"confirmed-{time.time_ns()}",
+        )
+        store_visual_asset_mask(self.project, slide, asset, dialog.result, points=dialog.points)
+        self.append_log(
+            f"SAM 分割已确认：{asset.asset_id}，候选 {dialog.result.selected_index + 1}/"
+            f"{len(dialog.result.masks)}，score={dialog.result.confidence:.4f}，"
+            f"面积比例={metrics['area_ratio']:.4f}；调试目录：{confirmed_debug}"
+        )
+        self.set_sam_progress_state("SAM 分割已确认", 100)
+        self.sam_review_dialog = None
+        self.pending_sam_asset = None
+        self.pending_sam_slide = None
+        self.pending_sam_points = []
         self.save_current_cache(show_message=False, log_success=False)
         self.render_current_slide()
 
+    def on_sam_review_cancelled(self):
+        self.sam_review_dialog = None
+        self.pending_sam_asset = None
+        self.pending_sam_slide = None
+        self.pending_sam_points = []
+        self.set_sam_progress_state("SAM 分割已取消", 0)
+        if getattr(self, "log", None) is not None:
+            self.append_log("已取消 SAM 分割，原图片区状态保持不变。")
+
     def on_asset_segmentation_failed(self, asset, message: str, exc):
-        asset.status = "fallback"
-        asset.segmentation_mode = "opencv"
-        asset.confirmed = True
-        asset.confidence = None
-        asset.model_id = None
         self.append_log(message)
-        self.render_current_slide()
+        self.set_sam_progress_state("SAM 分割失败，原图片区未修改", 0)
+        if getattr(self, "sam_review_dialog", None):
+            self.sam_review_dialog.set_busy(False)
         if isinstance(exc, (ImportError, ModuleNotFoundError)):
             detail = (
                 "SAM 2.1 运行组件未完整加载。请重新安装或修复程序依赖，"
@@ -1883,7 +2258,7 @@ class MainWindow(QMainWindow):
             )
         else:
             detail = str(exc)
-        QMessageBox.warning(self, "AI 分割失败", f"已回退 OpenCV 蒙版，可继续导出。\n\n{detail}")
+        QMessageBox.warning(self, "AI 分割失败", f"原图片区状态未修改。请调整提示点或重新框选后再试。\n\n{detail}")
 
     def on_text_edited(self):
         if not self.selected_item:
@@ -1914,13 +2289,25 @@ class MainWindow(QMainWindow):
             return
         self.start_export_to_path(Path(out_path))
 
-    def start_export_to_path(self, out_path: Path):
+    def start_export_to_path(
+        self,
+        out_path: Path,
+        *,
+        online_pages: set[int] | None = None,
+        accepted_local_pages: set[int] | None = None,
+        openai_api_key: str | None = None,
+    ):
         if not self.project:
             return
         self.current_export_output = out_path
+        self.current_export_options = {
+            "online_pages": set(online_pages or ()),
+            "accepted_local_pages": set(accepted_local_pages or ()),
+            "openai_api_key": openai_api_key,
+        }
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_label.setText("准备导出")
+        self.progress_label.setText("准备离线快速处理")
         self.save_current_cache(show_message=False, log_success=False)
         self.append_log("开始导出可编辑 PPT")
         self.run_worker(
@@ -1929,18 +2316,60 @@ class MainWindow(QMainWindow):
             self.project,
             out_path,
             enhance_images=self.enhance_images_cb.isChecked(),
+            online_pages=self.current_export_options["online_pages"],
+            accepted_local_pages=self.current_export_options["accepted_local_pages"],
+            openai_api_key=self.current_export_options["openai_api_key"],
         )
 
     def on_export_finished(self, _result):
         output = self.current_export_output
+        options = self.current_export_options
+        self.current_export_output = None
+        self.current_export_options = {}
         if output:
             self.append_log(f"可编辑 PPT 已导出：{output}")
-        self.current_export_output = None
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.progress_label.setText("导出完成")
         self.append_log("导出完成")
+        if self.project and not options.get("online_pages"):
+            review_results = [
+                result
+                for result in QualityPipeline(self.project.work_dir / "quality").load_results()
+                if result.status == QualityStatus.REVIEW_REQUIRED
+            ]
+            if review_results:
+                self.show_quality_review(output, review_results)
+                return
         QMessageBox.information(self, "完成", "可编辑 PPT 已导出完成。")
+
+    def show_quality_review(self, output: Path | None, results) -> None:
+        if not self.project or not output:
+            return
+        dialog = QualityReviewDialog(results, self)
+        decision = dialog.exec()
+        pipeline = QualityPipeline(self.project.work_dir / "quality")
+        page_indexes = {result.page_index for result in results}
+        if decision == QualityReviewDialog.ACCEPT_LOCAL:
+            for page_index in page_indexes:
+                pipeline.accept_local(page_index)
+            self.append_log(f"已接受 {len(page_indexes)} 页本地修复结果，后续导出将复用质量缓存。")
+            QMessageBox.information(self, "完成", "已接受本地修复结果，可编辑 PPT 已导出完成。")
+            return
+        if decision == QualityReviewDialog.REPAIR_ONLINE:
+            api_key, accepted = QInputDialog.getText(
+                self,
+                "在线高质量修复",
+                "输入 OpenAI API Key（仅当前导出进程使用，不会保存）：",
+                QLineEdit.EchoMode.Password,
+            )
+            if not accepted or not api_key.strip():
+                QMessageBox.information(self, "未开始在线修复", "未提供 API Key，已保留当前本地导出结果。")
+                return
+            self.append_log(f"已获确认，将仅在线修复 {len(page_indexes)} 个问题页。")
+            self.start_export_to_path(output, online_pages=page_indexes, openai_api_key=api_key.strip())
+            return
+        QMessageBox.information(self, "质量检查待处理", "已保留本地导出结果；下次导出时仍会提示检查这些页面。")
 
 
 def main():

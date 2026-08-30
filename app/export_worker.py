@@ -9,6 +9,7 @@ import warnings
 from pathlib import Path
 
 from .core import export_editable_ppt, ppt_project_from_data
+from .quality_pipeline import QualityMode
 
 
 def silence_dependency_info_logs() -> None:
@@ -42,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
         project = ppt_project_from_data(payload["project"])
         output_pptx = Path(payload["output_pptx"])
         enhance_images = bool(payload.get("enhance_images", True))
+        quality_mode = QualityMode(str(payload.get("quality_mode") or QualityMode.LOCAL_FAST.value))
+        online_pages = {int(page) for page in payload.get("online_pages", [])}
+        accepted_local_pages = {int(page) for page in payload.get("accepted_local_pages", [])}
 
         silence_dependency_info_logs()
         with open(os.devnull, "w", encoding="utf-8") as devnull:
@@ -51,6 +55,10 @@ def main(argv: list[str] | None = None) -> int:
                     output_pptx,
                     progress=progress_printer(sys.__stdout__),
                     enhance_images=enhance_images,
+                    quality_mode=quality_mode,
+                    online_pages=online_pages,
+                    accepted_local_pages=accepted_local_pages,
+                    openai_api_key=os.environ.get("PPTTOEDIT_OPENAI_API_KEY"),
                 )
         return 0
     except Exception:

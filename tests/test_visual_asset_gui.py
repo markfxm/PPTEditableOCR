@@ -1,15 +1,20 @@
 import os
 import unittest
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
+from PIL import Image
+
 from app.core import OCRBox, PPTSlide, VisualAsset
-from app.gui import EditableAssetItem, EditableRectItem, MainWindow
+from app.gui import EditableAssetItem, EditableRectItem, MainWindow, SamMaskReviewDialog
+from app.sam_segmentation import SegmentationResult
 from PySide6.QtCore import QEventLoop, QPointF, QRectF, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QProgressBar, QScrollArea
 
 
 class VisualAssetGuiTests(unittest.TestCase):
@@ -107,6 +112,184 @@ class VisualAssetGuiTests(unittest.TestCase):
         self.assertEqual(slide.visual_assets[0].source, "manual")
         self.assertFalse(slide.visual_assets[0].confirmed)
 
+    def test_sam_review_dialog_switches_candidates_and_shows_selected_score(self):
+        source = np.full((80, 100, 3), 240, dtype=np.uint8)
+        masks = np.zeros((3, 80, 100), dtype=np.uint8)
+        masks[0, 12:35, 12:45] = 255
+        masks[1, 11:38, 11:48] = 255
+        masks[1, 20:30, 11:22] = 0
+        masks[1, 20:30, 37:48] = 0
+        masks[2, 15:30, 15:35] = 255
+        result = SegmentationResult(masks, np.asarray([0.2, 0.9, 0.1]), 1, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(10, 10, 40, 30))
+
+        dialog = SamMaskReviewDialog(source, asset, result)
+        self.assertIn("候选 2/3", dialog.candidate_label.text())
+        self.assertIn("0.900", dialog.candidate_label.text())
+
+        dialog.next_candidate()
+        self.assertEqual(dialog.result.selected_index, 2)
+        self.assertIn("候选 3/3", dialog.candidate_label.text())
+        self.assertFalse(dialog.confirm_btn.isEnabled())
+        dialog.previous_candidate()
+        self.assertEqual(dialog.result.selected_index, 1)
+        self.assertTrue(dialog.confirm_btn.isEnabled())
+        dialog.close()
+
+    def test_sam_review_dialog_tracks_positive_negative_points_and_can_clear_them(self):
+        source = np.full((80, 100, 3), 240, dtype=np.uint8)
+        mask = np.zeros((1, 80, 100), dtype=np.uint8)
+        mask[0, 12:35, 12:45] = 255
+        result = SegmentationResult(mask, np.asarray([0.8]), 0, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(10, 10, 40, 30))
+        changes = []
+        dialog = SamMaskReviewDialog(source, asset, result, regenerate_cb=lambda points: changes.append(tuple(points)))
+
+        dialog.add_prompt_point(20.0, 20.0, 1)
+        dialog.add_prompt_point(8.0, 8.0, 0)
+        self.assertEqual(dialog.points, [(20.0, 20.0, 1), (8.0, 8.0, 0)])
+        dialog.undo_prompt_point()
+        self.assertEqual(dialog.points, [(20.0, 20.0, 1)])
+        dialog.clear_prompt_points()
+        self.assertEqual(dialog.points, [])
+        self.assertEqual(len(changes), 4)
+        dialog.close()
+
+    def test_sam_prompt_refresh_keeps_current_preview_zoom(self):
+        source = np.full((80, 100, 3), 240, dtype=np.uint8)
+        mask = np.zeros((1, 80, 100), dtype=np.uint8)
+        mask[0, 12:35, 12:45] = 255
+        result = SegmentationResult(mask, np.asarray([0.8]), 0, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(10, 10, 40, 30))
+        dialog = SamMaskReviewDialog(source, asset, result)
+        dialog.preview_view.scale(1.4, 1.4)
+        zoom_before = dialog.preview_view.transform().m11()
+
+        dialog.add_prompt_point(20.0, 20.0, 1)
+
+        self.assertAlmostEqual(dialog.preview_view.transform().m11(), zoom_before, places=5)
+        self.assertEqual(dialog.points, [(20.0, 20.0, 1)])
+        dialog.close()
+
+    def test_sam_review_fits_preview_after_dialog_layout(self):
+        source = np.full((800, 600, 3), 240, dtype=np.uint8)
+        masks = np.zeros((1, 800, 600), dtype=np.uint8)
+        masks[0, 100:700, 100:500] = 255
+        result = SegmentationResult(masks, np.asarray([0.8]), 0, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(100, 100, 400, 600))
+
+        dialog = SamMaskReviewDialog(source, asset, result)
+        dialog.resize(900, 700)
+        dialog.show()
+        self.app.processEvents()
+
+        self.assertGreater(dialog.preview_view.transform().m11(), 0.5)
+        dialog.close()
+
+    def test_sam_review_busy_state_keeps_preview_position(self):
+        source = np.full((80, 100, 3), 240, dtype=np.uint8)
+        mask = np.zeros((1, 80, 100), dtype=np.uint8)
+        mask[0, 12:35, 12:45] = 255
+        result = SegmentationResult(mask, np.asarray([0.8]), 0, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(10, 10, 40, 30))
+
+        dialog = SamMaskReviewDialog(source, asset, result, regenerate_cb=lambda _points: None)
+        dialog.show()
+        self.app.processEvents()
+        preview_top = dialog.preview_view.geometry().top()
+
+        dialog.set_busy(True)
+        self.app.processEvents()
+
+        self.assertEqual(dialog.preview_view.geometry().top(), preview_top)
+        dialog.close()
+
+    def test_start_and_cancel_sam_review_leave_original_asset_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "slide.png"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            asset = VisualAsset(
+                asset_id="device",
+                bbox=(10, 10, 40, 30),
+                source="manual",
+                status="candidate",
+                confirmed=False,
+            )
+            slide = PPTSlide(1, "slide.png", image_path, 100, 80, visual_assets=[asset])
+            window = MainWindow.__new__(MainWindow)
+            window.current_slide = slide
+            window.project = SimpleNamespace(work_dir=root)
+            window.pending_sam_asset = None
+            window.pending_sam_points = []
+            window.sam_review_dialog = None
+            window.progress_label = QLabel("运行中...")
+            window.progress_bar = QProgressBar()
+            window.progress_bar.setRange(0, 0)
+            window.run_worker = lambda *_args, **_kwargs: None
+            before = asset.__dict__.copy()
+
+            window._start_asset_segmentation(asset)
+            window.on_sam_review_cancelled()
+
+            self.assertEqual(asset.__dict__, before)
+            self.assertEqual(window.progress_label.text(), "SAM 分割已取消")
+            self.assertEqual((window.progress_bar.minimum(), window.progress_bar.maximum()), (0, 100))
+
+    def test_sam_candidates_ready_replaces_running_status_with_confirmation_prompt(self):
+        mask = np.zeros((1, 80, 100), dtype=np.uint8)
+        mask[0, 12:35, 12:45] = 255
+        result = SegmentationResult(mask, np.asarray([0.8]), 0, "cpu")
+        asset = VisualAsset(asset_id="device", bbox=(10, 10, 40, 30))
+        dialog = SimpleNamespace(points=[], set_result=lambda *_args: None)
+        window = MainWindow.__new__(MainWindow)
+        window.sam_review_dialog = dialog
+        window.pending_sam_asset = asset
+        window.pending_sam_slide = None
+        window.pending_sam_points = []
+        window.progress_label = QLabel("运行中...")
+        window.progress_bar = QProgressBar()
+        window.progress_bar.setRange(0, 0)
+        window.append_log = lambda _message: None
+
+        window.on_asset_segmented(
+            {
+                "asset": asset,
+                "slide": SimpleNamespace(),
+                "result": result,
+                "points": [],
+                "debug_dir": Path("debug"),
+            }
+        )
+
+        self.assertEqual(window.progress_label.text(), "SAM 候选已生成，请检查并确认分割")
+        self.assertEqual((window.progress_bar.minimum(), window.progress_bar.maximum()), (0, 100))
+        self.assertEqual(window.progress_bar.value(), 100)
+
+    def test_sam_worker_passes_writable_image_array_to_predictor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "slide.png"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            slide = PPTSlide(1, "slide.png", image_path, 100, 80)
+            asset = VisualAsset("device", (10, 10, 40, 30))
+            captured = {}
+
+            class CapturingEngine:
+                def segment_with_box(self, image, box, **_kwargs):
+                    captured["writeable"] = bool(image.flags.writeable)
+                    masks = np.zeros((1, 80, 100), dtype=np.uint8)
+                    masks[0, 12:35, 12:45] = 255
+                    return SegmentationResult(masks, np.asarray([0.8]), 0, "cpu")
+
+            window = MainWindow.__new__(MainWindow)
+            window.sam_engine = CapturingEngine()
+            project = SimpleNamespace(work_dir=root)
+            with patch("app.gui.save_segmentation_debug", return_value=root / "debug"):
+                window._run_asset_segmentation(project, slide, asset, [])
+
+            self.assertTrue(captured["writeable"])
+
     def test_sidebar_scrolls_instead_of_squashing_ai_controls(self):
         window = MainWindow()
         window.resize(900, 520)
@@ -165,10 +348,14 @@ class VisualAssetGuiTests(unittest.TestCase):
         window.close()
 
     def test_missing_sam_runtime_prompts_for_repair_and_restart(self):
-        asset = VisualAsset(asset_id="device", bbox=(0, 0, 20, 20))
+        asset = VisualAsset(asset_id="device", bbox=(0, 0, 20, 20), source="manual")
+        before = asset.__dict__.copy()
         window = MainWindow.__new__(MainWindow)
         window.append_log = lambda _message: None
         window.render_current_slide = lambda: None
+        window.progress_label = QLabel("运行中...")
+        window.progress_bar = QProgressBar()
+        window.progress_bar.setRange(0, 0)
 
         with patch("app.gui.QMessageBox.warning") as warning:
             window.on_asset_segmentation_failed(
@@ -180,6 +367,7 @@ class VisualAssetGuiTests(unittest.TestCase):
         message = warning.call_args.args[2]
         self.assertIn("重新安装", message)
         self.assertIn("重启", message)
+        self.assertEqual(asset.__dict__, before)
 
     def test_ready_model_status_shows_cuda_device(self):
         window = MainWindow()
